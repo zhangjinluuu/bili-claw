@@ -67,14 +67,30 @@ def require_ffmpeg() -> str:
     return path
 
 
-async def _run(command: list[str]) -> tuple[int, str]:
+async def _run_capture(command: list[str]) -> tuple[int, str, str]:
+    """跑一个命令，返回 ``(退出码, stdout, stderr)``。
+
+    两个都要收：**ffprobe 把 JSON 写到 stdout**，而 ffmpeg 把诊断写到 stderr。
+    只收 stderr 的话 ffprobe 的结果会被整个丢掉——``duration_of`` 就曾因此永远
+    返回 ``None``（空字符串解析 JSON 失败，被 except 吞掉，看起来只是"读不到时长"）。
+    """
     process = await asyncio.create_subprocess_exec(
         *command,
-        stdout=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await process.communicate()
-    return process.returncode or 0, stderr.decode("utf-8", errors="replace")
+    stdout, stderr = await process.communicate()
+    return (
+        process.returncode or 0,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
+
+async def _run(command: list[str]) -> tuple[int, str]:
+    """跑一个命令，只关心 stderr——ffmpeg 的错误信息在那里。"""
+    code, _, stderr = await _run_capture(command)
+    return code, stderr
 
 
 def choose_container(
@@ -176,7 +192,7 @@ async def duration_of(path: Path) -> float | None:
     if not ffprobe:
         return None
 
-    code, output = await _run(
+    code, stdout, _ = await _run_capture(
         [
             ffprobe,
             "-v",
@@ -191,6 +207,82 @@ async def duration_of(path: Path) -> float | None:
     if code != 0:
         return None
     try:
-        return float(json.loads(output)["format"]["duration"])
+        return float(json.loads(stdout)["format"]["duration"])
     except (KeyError, ValueError, json.JSONDecodeError):
         return None
+
+
+#: 合并后校验允许的时长偏差（秒）。B站给出的稿件时长按秒取整，与流里的真实时长总有
+#: 出入，超出这个幅度才值得让用户去播放确认。
+DURATION_TOLERANCE = 1.5
+
+
+async def probe_streams(path: Path) -> tuple[set[str], float | None] | None:
+    """用 ffprobe 读出产物里实际有哪些**类型的流**，以及时长。
+
+    探测不出来（ffprobe 缺失或执行失败）时返回 ``None``，调用方据此**放弃校验**。
+    这一点是刻意的：读不出来不等于文件坏，不能因为探测失败就否定一个已经合并好的
+    产物，更不能顺手把它删掉。
+    """
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return None
+
+    code, stdout, _ = await _run_capture(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    if code != 0:
+        return None
+    try:
+        payload = json.loads(stdout)
+        kinds = {item["codec_type"] for item in payload.get("streams", []) if item.get("codec_type")}
+        raw = payload.get("format", {}).get("duration")
+        duration = float(raw) if raw is not None else None
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return kinds, duration
+
+
+async def verify_output(
+    path: Path,
+    *,
+    expect_video: bool,
+    expect_audio: bool,
+    expected_duration: float | None = None,
+) -> list[str]:
+    """合并后校验（FR-05.4）。返回要讲给用户的告警；致命问题直接抛错。
+
+    抛错时产物**故意留着**：它也许还能手工修复，而调用方正是收到异常才不会继续
+    往下走删掉分片（FR-05.5）。
+    """
+    probed = await probe_streams(path)
+    if probed is None:
+        return []
+
+    kinds, duration = probed
+    wanted = (("video", "视频", expect_video), ("audio", "音频", expect_audio))
+    missing = [label for kind, label, want in wanted if want and kind not in kinds]
+    if missing:
+        raise BiliError(
+            f"合并后的文件缺少{'与'.join(missing)}流：{path}",
+            hint="ffmpeg 报告成功但产物不完整，多半是某条流下载时就坏了。\n"
+            "  分片已保留，加 --keep-parts 重跑可对照，或手动合并排查",
+        )
+
+    if expected_duration and duration and abs(duration - expected_duration) > DURATION_TOLERANCE:
+        return [
+            f"产物时长 {duration:.1f}s 与稿件标称的 {expected_duration:.0f}s 相差较大，"
+            "建议播放确认一下（稿件时长也可能本身是按秒取整的）"
+        ]
+    return []

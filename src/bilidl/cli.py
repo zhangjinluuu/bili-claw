@@ -43,7 +43,7 @@ from .errors import (
     UsageError,
 )
 from .models import Page, PlayUrlData, VideoInfo
-from .muxer import choose_container, find_ffmpeg, merge
+from .muxer import choose_container, find_ffmpeg, merge, verify_output
 from .naming import TEMPLATE_FIELDS, render_path, template_fields, validate_template
 from .progress import ProgressReporter
 
@@ -592,12 +592,23 @@ async def process_page(
         video_codec=stream.codec if stream else None,
     )
 
+    # FR-05.4：清理分片之前先确认产物真的完整。校验不过会抛错，于是下面的清理不会
+    # 执行，分片保留下来供排查（FR-05.5）。
+    warnings = await verify_output(
+        output,
+        expect_video=True,
+        expect_audio=audio is not None,
+        expected_duration=float(page.duration) if page.duration else None,
+    )
+
     if not options.keep_parts:
         video_temp.unlink(missing_ok=True)
         audio_temp.unlink(missing_ok=True)
 
     size_mb = output.stat().st_size / 1024 / 1024
     console.print(f"  [green]✓[/green] {output}　[dim]({size_mb:.1f} MB)[/dim]")
+    for message in warnings:
+        console.print(f"  [yellow]⚠[/yellow] {message}")
     return output
 
 
