@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import re
 import string
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 from .errors import UsageError
 

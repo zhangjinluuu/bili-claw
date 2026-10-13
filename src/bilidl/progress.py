@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Self
+
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -35,7 +37,7 @@ class ProgressReporter:
         self._enabled = enabled
         self._progress: Progress | None = None
 
-    def __enter__(self) -> ProgressReporter:
+    def __enter__(self) -> Self:
         if self._enabled:
             self._progress = Progress(
                 TextColumn("[bold]{task.description}"),

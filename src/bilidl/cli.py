@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
@@ -30,7 +31,14 @@ from . import __version__, quality
 from .api import BiliClient
 from .cookies import is_logged_in, resolve_cookie
 from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
-from .errors import AuthError, BiliError, ExitCode, LinkExpiredError, UsageError
+from .errors import (
+    AuthError,
+    BiliError,
+    ExitCode,
+    LinkExpiredError,
+    NetworkError,
+    UsageError,
+)
 from .models import Page, PlayUrlData, VideoInfo
 from .muxer import choose_container, find_ffmpeg, merge
 from .naming import TEMPLATE_FIELDS, render_path, template_fields, validate_template
@@ -90,20 +98,26 @@ async def resolve_target(client: BiliClient, text: str) -> Target:
     """解析输入；遇到 b23.tv 短链先跟一次跳转。"""
     raw = text.strip()
     short_match = SHORT_LINK_PATTERN.search(raw)
-    if short_match:
-        try:
-            response = await client.http.get(short_match.group(0), follow_redirects=True)
-        except Exception as exc:  # 网络异常在这里不值得中断，回落到直接解析
-            logging.getLogger("bilidl").debug("短链解析失败：%s", exc)
-        else:
-            resolved = str(response.url)
-            if BVID_PATTERN.search(resolved) or AID_PATTERN.search(resolved):
-                return parse_target_text(resolved)
-        raise UsageError(
-            f"短链跳转后仍无法识别视频：{short_match.group(0)}",
-            hint="请改用完整的视频链接",
-        )
-    return parse_target_text(raw)
+    if not short_match:
+        return parse_target_text(raw)
+
+    try:
+        response = await client.http.get(short_match.group(0), follow_redirects=True)
+    except httpx.HTTPError as exc:
+        # 展开短链必须联网。把"网断了"说成"链接无法识别"会让人去查链接本身，
+        # 方向就错了——这里如实报网络问题，并给出不需要联网的替代做法。
+        raise NetworkError(
+            f"无法展开短链：{short_match.group(0)}",
+            hint="短链需要联网解析；也可以直接使用完整的视频链接或 BV 号",
+        ) from exc
+
+    resolved = str(response.url)
+    if BVID_PATTERN.search(resolved) or AID_PATTERN.search(resolved):
+        return parse_target_text(resolved)
+    raise UsageError(
+        f"短链跳转后仍无法识别视频：{short_match.group(0)}",
+        hint="请改用完整的视频链接",
+    )
 
 
 def parse_page_spec(spec: str, total: int) -> list[int]:
@@ -301,14 +315,10 @@ async def _playurl(client: BiliClient, bvid: str, cid: int, qn: int) -> PlayUrlD
     """取播放地址；WBI 签名失效（-403）时刷新密钥重试一次。"""
     try:
         return await client.playurl(bvid=bvid, cid=cid, qn=qn)
-    except Exception as exc:
-        from .errors import AuthError
-
-        if isinstance(exc, AuthError):
-            logging.getLogger("bilidl").debug("playurl 返回权限错误，刷新 WBI 后重试")
-            client.invalidate_wbi()
-            return await client.playurl(bvid=bvid, cid=cid, qn=qn)
-        raise
+    except AuthError:
+        logging.getLogger("bilidl").debug("playurl 返回权限错误，刷新 WBI 后重试")
+        client.invalidate_wbi()
+        return await client.playurl(bvid=bvid, cid=cid, qn=qn)
 
 
 async def _download_stream(
@@ -637,7 +647,10 @@ async def run(options: Options, console: Console) -> int:
         if options.list_qualities or options.info_only:
             data = await _playurl(client, info.bvid, pages[0].cid, qn)
             if options.list_qualities:
-                print_qualities(console, data, quality.to_video_streams(data), preference=preference, logged_in=logged_in)
+                print_qualities(
+                    console, data, quality.to_video_streams(data),
+                    preference=preference, logged_in=logged_in,
+                )
             return ExitCode.OK
 
         downloader = StreamDownloader(
@@ -709,10 +722,18 @@ def cli(
     codec: str = typer.Option(None, "--codec", help="编码偏好，如 avc,hevc"),
     codec_compat: bool = typer.Option(False, "--codec-compat", help="优先 AVC(H.264)，兼容性最好"),
     audio_quality: str = typer.Option("auto", "--audio-quality", help="音轨：auto / best / 30280 …"),
-    audio_only: bool = typer.Option(False, "--audio-only", help="只下载音频，输出 .m4a（不转码）"),
+    audio_only: bool = typer.Option(
+        False,
+        "--audio-only",
+        help="只下载音频，不转码（AAC 存为 .m4a，Hi-Res 无损存为 .flac）",
+    ),
     container: str = typer.Option("mp4", "--container", help="容器：mp4 或 mkv"),
     output: Path = typer.Option(Path("downloads"), "-o", "--output", help="输出根目录"),
-    template: str = typer.Option(DEFAULT_TEMPLATE, "--template", help=f"命名模板，可用变量：{', '.join(TEMPLATE_FIELDS)}"),
+    template: str = typer.Option(
+        DEFAULT_TEMPLATE,
+        "--template",
+        help=f"命名模板，可用变量：{', '.join(TEMPLATE_FIELDS)}",
+    ),
     page: str = typer.Option(None, "-p", "--page", help="分P：单个序号、1-3、1,3,5 或 all"),
     cookie: str = typer.Option(None, "--cookie", help="直接给出 Cookie 字符串"),
     cookie_file: Path = typer.Option(None, "--cookie-file", help="Cookie 文件（Netscape 或粘贴的一行）"),

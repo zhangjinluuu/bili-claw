@@ -11,7 +11,6 @@ from bilidl.errors import AuthError, ExitCode, QualityUnavailableError, UsageErr
 from bilidl.quality import (
     ANONYMOUS_MAX_QN,
     AudioStream,
-    QualityRequest,
     VideoStream,
     parse_codec_preference,
     parse_quality,
@@ -340,7 +339,10 @@ def test_codec_preference_breaks_ties() -> None:
         vs(80, 1080, codec="avc", codecid=AVC, bandwidth=1_500_000),
     ]
     assert select_video(streams, parse_quality("max"), granted_qn=127).stream.codec == "avc"
-    assert select_video(streams, parse_quality("max"), granted_qn=127, preference=("av1", "hevc", "avc")).stream.codec == "av1"
+    chosen = select_video(
+        streams, parse_quality("max"), granted_qn=127, preference=("av1", "hevc", "avc")
+    )
+    assert chosen.stream.codec == "av1"
 
 
 def test_bandwidth_breaks_codec_ties() -> None:
@@ -353,7 +355,10 @@ def test_no_dash_streams_is_an_error() -> None:
         select_video([], parse_quality("max"), granted_qn=127)
 
 
-@pytest.mark.parametrize("spec,expected", [("avc,hevc", ("avc", "hevc", "av1")), ("av1", ("av1", "avc", "hevc")), (None, PREF)])
+@pytest.mark.parametrize(
+    "spec,expected",
+    [("avc,hevc", ("avc", "hevc", "av1")), ("av1", ("av1", "avc", "hevc")), (None, PREF)],
+)
 def test_parse_codec_preference(spec: str | None, expected: tuple[str, ...]) -> None:
     assert parse_codec_preference(spec) == expected
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from bilidl.downloader import Chunk, parse_rate, plan_chunks
@@ -48,7 +50,7 @@ def test_plan_chunks_covers_every_byte_exactly_once() -> None:
     assert chunks[0].start == 0
     assert chunks[-1].end == total - 1
     assert sum(chunk.length for chunk in chunks) == total
-    for previous, current in zip(chunks, chunks[1:]):
+    for previous, current in itertools.pairwise(chunks):
         assert current.start == previous.end + 1
 
 

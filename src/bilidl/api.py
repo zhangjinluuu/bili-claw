@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from collections.abc import Container
-from typing import Any
+from typing import Any, Self
 
 import httpx
 from pydantic import ValidationError
@@ -83,7 +83,7 @@ class BiliClient:
 
     # -- 生命周期 ---------------------------------------------------------- #
 
-    async def __aenter__(self) -> BiliClient:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:

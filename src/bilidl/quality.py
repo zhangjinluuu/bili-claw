@@ -13,8 +13,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Iterable, Literal, Sequence
+from typing import Literal
 
 from .errors import AuthError, QualityUnavailableError, UsageError
 from .models import DashAudio, DashVideo, PlayUrlData

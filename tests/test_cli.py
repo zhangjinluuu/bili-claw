@@ -7,7 +7,6 @@ import pytest
 from bilidl.cli import Target, parse_page_spec, parse_target_text
 from bilidl.errors import UsageError
 
-
 # --------------------------------------------------------------------------- #
 # 稿件标识
 # --------------------------------------------------------------------------- #

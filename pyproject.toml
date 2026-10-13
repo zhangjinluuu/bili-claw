@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
 
 [project.scripts]
 bilidl = "bilidl.cli:main"
@@ -27,3 +27,26 @@ packages = ["src/bilidl"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "BLE", "RUF", "PYI"]
+ignore = [
+    # typer 的选项只能写成函数签名默认值里的 typer.Option(...)，这是框架规定的写法，
+    # B008 在这里是误报。
+    "B008",
+    # RUF001/002/003 检查"有歧义的 Unicode 字符"（全角逗号、括号、冒号……）。
+    # 本项目的注释、docstring 与面向用户的文案全是中文，全角标点正是中文的正确写法，
+    # 改成半角反而难读。这三条规则只适用于纯英文代码库，这里整体关掉。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 分片写盘与 muxer 里的 Path 操作都是普通阻塞调用，每次只有 256KB 或一次
+    # stat/unlink，开销在微秒级；而下载速度受网络限制，为这点开销引入
+    # asyncio.to_thread 的线程池调度得不偿失。这是有意的取舍，不是疏漏。
+    "ASYNC230",
+    "ASYNC240",
+]
