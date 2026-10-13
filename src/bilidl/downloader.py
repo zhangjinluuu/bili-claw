@@ -191,7 +191,13 @@ class StreamDownloader:
             on_total(total)
 
         if not supports_range or total <= 0:
-            await self._download_whole(url, part, total, on_progress)
+            try:
+                await self._download_whole(url, part, total, on_progress)
+            except BiliError:
+                # 整段下载没有 sidecar，半个文件没有任何续传价值（下次会从头
+                # 覆盖写），留着只是白占磁盘——可能还是几百 MB。
+                part.unlink(missing_ok=True)
+                raise
         else:
             await self._download_chunked(urls, part, sidecar, total, on_progress, identity)
 

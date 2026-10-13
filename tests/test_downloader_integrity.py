@@ -13,12 +13,13 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import pytest
 
 from bilidl.downloader import StreamDownloader
-from bilidl.errors import ExitCode, FileSystemError, NetworkError
+from bilidl.errors import BiliError, ExitCode, FileSystemError, NetworkError
 
 #: 下载器允许的最小分片。用它来把测试负载压到几百 KiB，跑得快。
 CHUNK = 64 * 1024
@@ -270,3 +271,26 @@ async def test_unwritable_output_directory_is_a_filesystem_error(tmp_path) -> No
         assert info.value.exit_code is ExitCode.FILESYSTEM
     finally:
         blocked.chmod(0o700)
+
+
+async def test_failed_whole_body_download_leaves_no_litter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """整段下载没有 sidecar，半个文件续不了传（下次从头覆盖写），只是白占磁盘。"""
+    payload = make_payload(1, SIZE)
+
+    class _Dies(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[override]
+            yield payload[: 2 * CHUNK]
+            raise httpx.ReadError("连接断了")
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 不支持 Range，逼下载器走整段路径
+        return httpx.Response(200, headers={"Content-Length": str(SIZE)}, stream=_Dies())
+
+    async with _downloader(handler) as downloader:
+        with pytest.raises(BiliError):
+            await downloader.download(["https://cdn.example/x"], tmp_path / "out.m4s")
+
+    assert list(tmp_path.glob("*.part*")) == []

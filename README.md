@@ -179,7 +179,7 @@ bilidl <URL>
 --on-unavailable TEXT     档位不可用：degrade（默认）| fail
 --codec TEXT              编码偏好，如 avc,hevc
 --audio-quality TEXT      音轨：auto（默认）| best | 30280 …
---audio-only              只下载音频，输出 .m4a（不转码）
+--audio-only              只下载音频，不转码（AAC 存为 .m4a，Hi-Res 无损存为 .flac）
 --container TEXT          容器：mp4（默认）| mkv
 -o, --output PATH         输出根目录（默认 downloads）
 --template TEXT           命名模板（默认 {up}/{title}）
@@ -194,11 +194,27 @@ bilidl <URL>
 --debug                   输出调试日志
 ```
 
+### Cookie 失效了会怎样
+
+如果提供的 Cookie 已经不是登录态（最常见的是 SESSDATA 过期），程序**不会**悄悄
+以未登录身份继续下载——那会让你以为拿到了 1080P、其实只有 480P。它会直接停下：
+
+```
+  ✗ Cookie 已失效（来源：/Users/you/.bilidl/cookies.txt）——B站不认为这是登录态
+  → 多半是 SESSDATA 过期了。重新登录B站并复制一份新的 Cookie 覆盖它；
+```
+
+退出码是 **4**。想继续用未登录身份下载，把 Cookie 去掉即可（最高 480P）。
+
+失效 Cookie 的实际表现值得一提：服务端拒掉凭据后 `playurl` 会返回
+`quality=0`、`dash=null`，看起来完全像"这个视频没有可用的视频流"。不先查登录态
+的话，用户就会被引去怀疑视频本身，而真正的问题在自己的凭据上。
+
 ### 命名模板
 
 `--template` 渲染出的相对路径会拼到 `--output` 下面，扩展名自动添加。
 
-可用变量：`{title}` `{bvid}` `{aid}` `{p}` `{p_name}` `{up}` `{mid}` `{qn}` `{quality}` `{date}` `{datetime}`
+可用变量：`{title}` `{bvid}` `{aid}` `{cid}` `{p}` `{p_name}`/`{pname}` `{up}` `{mid}` `{qn}` `{quality}` `{codec}` `{date}` `{datetime}`
 
 支持 `{p:02d}` 这类格式说明符。
 
