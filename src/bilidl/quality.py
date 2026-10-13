@@ -248,12 +248,14 @@ class QualityRequest:
     """用户对"要什么清晰度"的表达。"""
 
     raw: str
-    kind: Literal["max", "height", "qn"]
+    kind: Literal["max", "height", "qn", "ask"]
     target: int | None = None
 
     def describe(self) -> str:
         if self.kind == "max":
             return "最高可用"
+        if self.kind == "ask":
+            return "交互选择"
         if self.kind == "height":
             return f"不超过 {self.target}P"
         return QUALITY_NAMES.get(self.target or 0, f"qn{self.target}")
@@ -262,8 +264,8 @@ class QualityRequest:
 def parse_quality(raw: str) -> QualityRequest:
     """把 ``-q`` 的取值解析成 ``QualityRequest``。
 
-    接受：``max``/``best``、像素高度（``1080``、``1080p``、``4k``）、
-    以及 B站档位号（``80``、``116``）。
+    接受：``max``/``best``、``ask``（交互选择）、像素高度（``1080``、``1080p``、
+    ``4k``）、以及 B站档位号（``80``、``116``）。
     """
     text = str(raw).strip().lower()
     if not text:
@@ -271,6 +273,10 @@ def parse_quality(raw: str) -> QualityRequest:
 
     if text in {"max", "best", "highest"}:
         return QualityRequest(raw=raw, kind="max")
+
+    # ask 与 max 一样不指定具体档位，要到拿到响应之后才能决定——区别在于由谁来选。
+    if text == "ask":
+        return QualityRequest(raw=raw, kind="ask")
 
     if text.endswith("p") and text[:-1].isdigit():
         text = text[:-1]
@@ -293,7 +299,29 @@ def parse_quality(raw: str) -> QualityRequest:
 def _quality_help() -> str:
     heights = "、".join(str(h) for h in HEIGHT_PRESETS)
     names = "、".join(f"{qn}={name}" for qn, name in sorted(QUALITY_NAMES.items()))
-    return f"可用写法：max（最高可用）、像素高度（{heights}）、或 B站档位号（{names}）"
+    return (
+        f"可用写法：max（最高可用）、ask（列出现有档位后再选）、"
+        f"像素高度（{heights}）、或 B站档位号（{names}）"
+    )
+
+
+def sort_for_menu(
+    streams: Iterable[VideoStream], preference: tuple[str, ...] = DEFAULT_CODEC_PREFERENCE
+) -> list[VideoStream]:
+    """把可选流排成「最适合从上往下挑」的顺序，供 ``-q ask`` 的菜单使用。
+
+    先按像素高度降序，再按用户的编码偏好，最后按码率降序。这样第一项就是"最好的
+    那个"，用户直接回车即可；同高度下的 AVC/HEVC/AV1 按用户偏好排列，而不是按
+    接口返回的偶然顺序。
+    """
+    def rank(stream: VideoStream) -> tuple[int, int, int]:
+        try:
+            codec_rank = preference.index(stream.codec)
+        except ValueError:
+            codec_rank = len(preference)
+        return (-stream.height, codec_rank, -stream.bandwidth)
+
+    return sorted(streams, key=rank)
 
 
 def parse_codec_preference(spec: str | None, *, compat: bool = False) -> tuple[str, ...]:
@@ -320,12 +348,14 @@ def parse_codec_preference(spec: str | None, *, compat: bool = False) -> tuple[s
 def qn_for_request(request: QualityRequest) -> int:
     """把用户意图翻译成要发给 playurl 的 qn。
 
-    * ``max`` → 直接要最高档（``MAX_QN``），由B站按账号权限给到它能给的最高档；
+    * ``max`` / ``ask`` → 直接要最高档（``MAX_QN``），由B站按账号权限给到它能给的
+      最高档。``ask`` 也必须先要最高档：playurl 只授予"请求档位降级后"的那一组流，
+      请求 max 才能一次拿到该账号权限内的全部可选流，作为菜单数据。
     * ``height H`` → 取阶梯里**高度不超过 H 的最高档**，例如 ``-q 1440`` 会落到
       1080P60（B站没有 1440P 这一档）；
     * ``qn Q`` → 原样发出。
     """
-    if request.kind == "max":
+    if request.kind in {"max", "ask"}:
         return MAX_QN
     if request.kind == "qn":
         assert request.target is not None

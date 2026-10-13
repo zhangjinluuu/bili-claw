@@ -136,3 +136,32 @@ def test_redact_does_not_touch_other_cookies_values_by_accident() -> None:
     redacted = redact("lang=zh-CN; SESSDATA=secret")
     assert "zh-CN" in redacted
     assert "secret" not in redacted
+
+
+def test_empty_cookie_file_is_reported_as_empty(tmp_path: Path) -> None:
+    """用户建了文件但内容没写进去（编辑器新建、粘贴失败）是很常见的情况。
+
+    笼统地说"没解析出任何字段"会把人引去查格式，而格式根本没问题。
+    """
+    path = tmp_path / "cookies.txt"
+    path.write_text("")
+    with pytest.raises(UsageError) as info:
+        load_from_file(path)
+    assert "空" in info.value.message
+
+
+def test_whitespace_only_cookie_file_is_also_empty(tmp_path: Path) -> None:
+    path = tmp_path / "cookies.txt"
+    path.write_text("\n\n   \n\t\n")
+    with pytest.raises(UsageError) as info:
+        load_from_file(path)
+    assert "空" in info.value.message
+
+
+def test_malformed_cookie_file_keeps_the_format_hint(tmp_path: Path) -> None:
+    """有内容但不是任何已知格式时，提示要说清支持哪两种写法。"""
+    path = tmp_path / "cookies.txt"
+    path.write_text("这不是 cookie，只是一段随便的文字\n")
+    with pytest.raises(UsageError) as info:
+        load_from_file(path)
+    assert "Netscape" in (info.value.hint or "")

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
+import io
+import sys
 
+import pytest
+from rich.console import Console
+
+from bilidl import cli, quality
 from bilidl.cli import Target, parse_page_spec, parse_target_text
-from bilidl.errors import UsageError
+from bilidl.errors import QualityUnavailableError, UsageError
 
 # --------------------------------------------------------------------------- #
 # 稿件标识
@@ -133,3 +138,74 @@ def test_garbage_page_spec_is_a_usage_error() -> None:
 
 def test_empty_page_spec_defaults_to_first_page() -> None:
     assert parse_page_spec("", 10) == [1]
+
+
+# --------------------------------------------------------------------------- #
+# -q ask 的交互选择（FR-03 第 1 条 / E2E-3）
+
+
+def _stream(height: int, codec: str = "avc") -> quality.VideoStream:
+    return quality.VideoStream(
+        qn=32 if height >= 480 else 16,
+        codecid={"avc": 7, "hevc": 12, "av1": 13}[codec],
+        codec=codec,
+        width=int(height * 16 / 9),
+        height=height,
+        fps=30.0,
+        bandwidth=400_000,
+        urls=("https://cdn.example/v.m4s",),
+    )
+
+
+def _console() -> Console:
+    return Console(file=io.StringIO(), width=200, no_color=True)
+
+
+def test_prompt_quality_refuses_to_hang_without_a_terminal() -> None:
+    """管道/脚本里必须立刻报错，而不是安静地等输入。
+
+    一条自动化命令最糟的失败方式是挂在那里直到超时——用户看到的只是一个不动的
+    进程，完全不知道它在等人按键。
+    """
+    with pytest.raises(UsageError) as info:
+        cli._prompt_quality([_stream(480), _stream(360)], ("avc",), _console())
+
+    assert "交互式终端" in info.value.message
+    # 提示必须给出可以直接复制去用的替代写法
+    assert "480P" in (info.value.hint or "")
+
+
+def test_prompt_quality_returns_the_chosen_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_can_prompt", lambda _console: True)
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: "2")
+    chosen = cli._prompt_quality([_stream(480, "hevc"), _stream(360, "avc")], ("avc", "hevc"), _console())
+    assert chosen.height == 360, "选了第 2 项就必须拿到第 2 项"
+
+
+def test_prompt_quality_menu_puts_the_best_option_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """第 1 项是最好的那档，直接回车即等于 -q max。"""
+    monkeypatch.setattr(cli, "_can_prompt", lambda _console: True)
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: "1")
+    chosen = cli._prompt_quality([_stream(360), _stream(480)], ("avc",), _console())
+    assert chosen.height == 480
+
+
+def test_prompt_quality_errors_when_no_stream_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_can_prompt", lambda _console: True)
+    with pytest.raises(QualityUnavailableError):
+        cli._prompt_quality([], ("avc",), _console())
+
+
+def test_can_prompt_survives_closed_stdin() -> None:
+    """stdin 已关闭时 isatty() 会抛异常，不能让它冒到用户面前。"""
+
+    class _Closed:
+        def isatty(self) -> bool:
+            raise ValueError("I/O operation on closed file")
+
+    original = sys.stdin
+    sys.stdin = _Closed()  # type: ignore[assignment]
+    try:
+        assert cli._can_prompt(_console()) is False
+    finally:
+        sys.stdin = original

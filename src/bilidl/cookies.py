@@ -56,6 +56,17 @@ def load_from_file(path: Path) -> dict[str, str]:
     except OSError as exc:
         raise UsageError(f"无法读取 Cookie 文件：{path}（{exc.strerror}）") from exc
 
+    # 空文件要先单独说清楚。否则会落到下面"没解析出任何字段"的分支，把人引去查格式——
+    # 而真正的原因是内容根本没写进去（编辑器新建了文件、但粘贴没成功）。
+    if not text.strip():
+        raise UsageError(
+            f"Cookie 文件是空的：{path}",
+            hint=(
+                "把浏览器里的 Cookie 粘贴进去（浏览器开发者工具 → Network → "
+                "任意 bilibili.com 请求 → Request Headers → Cookie），然后保存"
+            ),
+        )
+
     cookies: dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
@@ -78,7 +89,10 @@ def load_from_file(path: Path) -> dict[str, str]:
     if not pasted:
         raise UsageError(
             f"Cookie 文件里没有解析出任何字段：{path}",
-            hint="支持 Netscape cookies.txt，或直接粘贴浏览器里复制的 Cookie 字符串",
+            hint=(
+                "支持 Netscape cookies.txt，或直接粘贴浏览器里复制的 Cookie 字符串"
+                "（形如 SESSDATA=xxx; bili_jct=yyy）"
+            ),
         )
     return pasted
 

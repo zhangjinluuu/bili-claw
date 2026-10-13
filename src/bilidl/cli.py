@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.padding import Padding
+from rich.prompt import Prompt
 from rich.table import Table
 
 from . import __version__, quality
@@ -37,6 +39,7 @@ from .errors import (
     ExitCode,
     LinkExpiredError,
     NetworkError,
+    QualityUnavailableError,
     UsageError,
 )
 from .models import Page, PlayUrlData, VideoInfo
@@ -360,6 +363,77 @@ def build_fields(info: VideoInfo, page: Page, *, qn: int, label: str) -> dict[st
     }
 
 
+def _can_prompt(console: Console) -> bool:
+    """能否安全地向用户提问。
+
+    管道、脚本、CI 里 stdin 常常已经关闭或不在终端上，此时 rich 的 Prompt 会抛
+    EOFError，或者干脆一直等输入。一条自动化命令绝不能悄悄挂在那里，所以宁可
+    提前报错。
+    """
+    try:
+        return bool(console.is_terminal and sys.stdin.isatty())
+    except (ValueError, OSError):
+        # stdin 已关闭时 isatty() 会抛异常，一律当作不可交互。
+        return False
+
+
+def _prompt_quality(
+    streams: list[quality.VideoStream],
+    preference: tuple[str, ...],
+    console: Console,
+) -> quality.VideoStream:
+    """``-q ask``：把"实际拿得到"的档位列出来让用户挑（对应 E2E-3）。
+
+    菜单只列账号真的拿得到的流——把拿不到的档位摆出来让人选、选完才发现没权限，
+    比不给选更糟。默认值是最高档，所以直接回车就等于 ``-q max``。
+    """
+    if not streams:
+        raise QualityUnavailableError("该分P 没有可下载的视频流")
+
+    menu = quality.sort_for_menu(streams, preference)
+
+    if not _can_prompt(console):
+        raise UsageError(
+            "-q ask 需要交互式终端，当前环境无法读取键盘输入",
+            hint=(
+                "请直接指定档位，例如 -q 1080、-q 720 或 -q 80。"
+                f"当前实际可选：{'、'.join(s.describe() for s in menu)}"
+            ),
+        )
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2, 0, 0))
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("清晰度")
+    table.add_column("编码")
+    table.add_column("码率", justify="right")
+    table.add_column("分辨率")
+    for index, stream in enumerate(menu, start=1):
+        table.add_row(
+            str(index),
+            stream.label,
+            stream.codec,
+            f"{stream.bandwidth / 1000:.0f} kbps" if stream.bandwidth else "—",
+            f"{stream.width}×{stream.height}" if stream.width and stream.height else "—",
+        )
+    console.print(table)
+
+    try:
+        answer = Prompt.ask(
+            "  请选择要下载的清晰度",
+            choices=[str(i) for i in range(1, len(menu) + 1)],
+            default="1",
+            console=console,
+            show_choices=False,
+        )
+    except EOFError:
+        raise UsageError(
+            "-q ask 读取输入时遇到文件结束（stdin 已关闭）",
+            hint="请直接指定档位，例如 -q 1080",
+        ) from None
+
+    return menu[int(answer) - 1]
+
+
 async def process_page(
     client: BiliClient,
     downloader: StreamDownloader,
@@ -377,18 +451,28 @@ async def process_page(
     """下载并合并单个分P，返回产物路径（跳过时返回 ``None``）。"""
     bvid = info.bvid
     stream = None
-    if options.audio_only:
-        # 只要音频时不去协商视频清晰度：否则 `--on-unavailable fail` 会因为视频档位
-        # 拿不到而中止一次纯音频下载——用户根本没要视频。顺带用最高档请求，
-        # 这样能拿到该账号权限内最好的音轨。
+    # 两种情况下都要用最高档去问：
+    #   * 只要音频时——否则 `--on-unavailable fail` 会因为视频档位拿不到而中止一次
+    #     纯音频下载，用户根本没要视频；
+    #   * 交互选择时——playurl 只授予"请求档位降级后"的那一组流，只有请求最高档才能
+    #     一次拿到该账号权限内的全部可选流，作为菜单数据。
+    if options.audio_only or request.kind == "ask":
         qn = quality.MAX_QN
-        data = await _playurl(client, bvid, page.cid, qn)
-        audio_streams = quality.to_audio_streams(data)
     else:
         qn = quality.qn_for_request(request)
-        data = await _playurl(client, bvid, page.cid, qn)
-        audio_streams = quality.to_audio_streams(data)
 
+    data = await _playurl(client, bvid, page.cid, qn)
+    audio_streams = quality.to_audio_streams(data)
+
+    if options.audio_only:
+        pass
+    elif request.kind == "ask":
+        stream = _prompt_quality(quality.to_video_streams(data), preference, console)
+        # 用户挑的就是实际拿到的那一档，不存在"降级"，也不必再走一遍协商逻辑。
+        # 把 request 收敛成一个具体的 qn，后续换链（_refresh_video）就能原样复用。
+        request = quality.QualityRequest(raw=request.raw, kind="qn", target=stream.qn)
+        console.print(f"  [green]✓[/green] 已选择 {stream.describe()}")
+    else:
         selection = quality.select_video(
             quality.to_video_streams(data),
             request,
@@ -653,7 +737,10 @@ async def run(options: Options, console: Console) -> int:
         print_video_info(console, info, logged_in=logged_in, cookie_source=cookie_source, pages=pages)
 
         qn = quality.qn_for_request(request)
-        console.print(f"[dim]ℹ 请求清晰度：{request.describe()}（qn={qn}）[/dim]")
+        if request.kind == "ask":
+            console.print("[dim]ℹ 清晰度：交互选择——将列出当前账号实际可下载的档位[/dim]")
+        else:
+            console.print(f"[dim]ℹ 请求清晰度：{request.describe()}（qn={qn}）[/dim]")
 
         if options.list_qualities or options.info_only:
             data = await _playurl(client, info.bvid, pages[0].cid, qn)
@@ -726,7 +813,9 @@ def configure_logging(debug: bool) -> None:
 @app.command()
 def cli(
     url: str = typer.Argument(None, help="视频链接、BV 号、av 号，或 b23.tv 短链"),
-    quality_: str = typer.Option("max", "-q", "--quality", help="清晰度：max / 1080 / 720 / 80 / 116 …"),
+    quality_: str = typer.Option(
+        "max", "-q", "--quality", help="清晰度：max / ask / 1080 / 720 / 80 / 116 …"
+    ),
     on_unavailable: str = typer.Option(
         "degrade", "--on-unavailable", help="档位不可用时：degrade（降级+提示）或 fail（报错退出）"
     ),

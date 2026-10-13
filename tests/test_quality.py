@@ -10,6 +10,7 @@ import pytest
 from bilidl.errors import AuthError, ExitCode, QualityUnavailableError, UsageError
 from bilidl.quality import (
     ANONYMOUS_MAX_QN,
+    MAX_QN,
     AudioStream,
     VideoStream,
     parse_codec_preference,
@@ -18,6 +19,7 @@ from bilidl.quality import (
     required_tier,
     select_audio,
     select_video,
+    sort_for_menu,
 )
 
 AVC, HEVC, AV1 = 7, 12, 13
@@ -416,3 +418,78 @@ def test_quality_request_describe() -> None:
     assert parse_quality("max").describe() == "最高可用"
     assert parse_quality("1080").describe() == "不超过 1080P"
     assert parse_quality("80").describe() == "1080P"
+
+
+# --------------------------------------------------------------------------- #
+# -q ask（交互选择，对应 E2E-3）
+
+
+def test_parse_quality_accepts_ask() -> None:
+    request = parse_quality("ask")
+    assert request.kind == "ask"
+    assert request.target is None
+    assert "交互" in request.describe()
+
+
+@pytest.mark.parametrize("spelling", ["ASK", " Ask ", "ask"])
+def test_ask_is_case_and_space_insensitive(spelling: str) -> None:
+    assert parse_quality(spelling).kind == "ask"
+
+
+@pytest.mark.parametrize("spelling", ["as", "asks", "interactive", "?"])
+def test_ask_rejects_undocumented_spellings(spelling: str) -> None:
+    """只认文档写明的 ask。
+
+    宽松地猜用户意图，会让一个拼错的参数静默走进交互流程（或在脚本里直接失败），
+    不如当场报错。
+    """
+    with pytest.raises(UsageError):
+        parse_quality(spelling)
+
+
+def test_ask_requests_the_top_tier() -> None:
+    """ask 也必须请求最高档，不能请求某个"默认"档。
+
+    playurl 只授予"请求档位降级后"的那一组流：请求 480P 只会拿回 480P 及更低，
+    菜单里就凭空少了用户本来有权限拿的档位。
+    """
+    assert qn_for_request(parse_quality("ask")) == MAX_QN
+    assert qn_for_request(parse_quality("ask")) == qn_for_request(parse_quality("max"))
+
+
+def test_sort_for_menu_puts_the_best_first() -> None:
+    streams = [
+        vs(16, 360, codec="avc", codecid=AVC, bandwidth=330_000),
+        vs(32, 480, codec="hevc", codecid=HEVC, bandwidth=253_000),
+        vs(32, 480, codec="avc", codecid=AVC, bandwidth=475_000),
+        vs(16, 360, codec="av1", codecid=AV1, bandwidth=165_000),
+    ]
+    ordered = sort_for_menu(streams, PREF)
+    assert [(s.height, s.codec) for s in ordered] == [
+        (480, "avc"),
+        (480, "hevc"),
+        (360, "avc"),
+        (360, "av1"),
+    ]
+
+
+def test_sort_for_menu_honours_codec_preference_over_bitrate() -> None:
+    """同高度下按用户偏好排，而不是按码率——偏好是用户显式表达的意图。"""
+    streams = [
+        vs(32, 480, codec="avc", codecid=AVC, bandwidth=475_000),
+        vs(32, 480, codec="av1", codecid=AV1, bandwidth=227_000),
+    ]
+    assert sort_for_menu(streams, ("av1", "hevc", "avc"))[0].codec == "av1"
+
+
+def test_sort_for_menu_does_not_mutate_input() -> None:
+    streams = [vs(16, 360), vs(32, 480, bandwidth=900_000)]
+    before = list(streams)
+    sort_for_menu(streams, PREF)
+    assert streams == before
+
+
+def test_sort_for_menu_tolerates_unknown_codec() -> None:
+    """接口将来新增编码时不该把菜单排序搞崩，排到最后即可。"""
+    streams = [vs(32, 480, codec="vp9", codecid=99), vs(16, 360)]
+    assert sort_for_menu(streams, PREF)[0].height == 480
