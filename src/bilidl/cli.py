@@ -568,11 +568,22 @@ async def run_check(options: Options, console: Console) -> int:
     """
     code = ExitCode.OK
 
+    def failed(candidate: ExitCode) -> None:
+        """只让第一个失败原因占据退出码。
+
+        三项检查是依次做的，后面发现问题时不该把前面的结论冲掉：没有 ffmpeg 又刚好
+        断网时，真正该先解决的是装 ffmpeg（退出码 6），而不是让人去排查网络。
+        顺序本身编码了优先级：依赖 → 网络/登录态。
+        """
+        nonlocal code
+        if code is ExitCode.OK:
+            code = candidate
+
     ffmpeg = find_ffmpeg()
     if ffmpeg:
         console.print(f"[green]✓[/green] ffmpeg：{ffmpeg}")
     else:
-        code = ExitCode.MISSING_DEPENDENCY
+        failed(ExitCode.MISSING_DEPENDENCY)
         console.print("[red]✗[/red] 未找到 ffmpeg——音视频合并无法进行（退出码 6）")
         console.print("  [dim]→ macOS: brew install ffmpeg[/dim]")
 
@@ -586,7 +597,7 @@ async def run_check(options: Options, console: Console) -> int:
     async with BiliClient(cookies=cookies, retries=options.retries) as client:
         nav = await client.probe_login()
         if nav is None:
-            code = ExitCode.NETWORK
+            failed(ExitCode.NETWORK)
             console.print("[red]✗[/red] 无法访问 B站接口（网络不通或接口已变更）")
         elif nav.isLogin:
             # 用户真正想知道的是"登录之后我能下到多高"，而不是"cookie 读到了没有"，
@@ -602,7 +613,7 @@ async def run_check(options: Options, console: Console) -> int:
         elif has_cookie:
             # 本地读到了 Cookie、B站却不认账：这不是"没登录"，而是登录态已经失效。
             # 含糊地说"接口可达"会让人去查网络，方向就错了。
-            code = ExitCode.AUTH
+            failed(ExitCode.AUTH)
             console.print(
                 "[red]✗[/red] Cookie 已读到，但 B站不认为这是登录态——多半是 SESSDATA 过期了"
             )
