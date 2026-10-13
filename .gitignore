@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 下载产物与临时文件
+downloads/
+*.part
+*.part.json
+
+# 凭据：绝不入库
+cookies.txt
+*_cookies.txt
+.env
+.env.*
+
+# 工具
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store

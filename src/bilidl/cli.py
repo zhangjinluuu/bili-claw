@@ -1,0 +1,773 @@
+"""命令行入口。
+
+对应需求：FR-01 输入解析、FR-02 信息展示、FR-03 清晰度选择、FR-04 下载、
+FR-05 合并、FR-07 命名、FR-09 登录态、FR-11 进度与退出码、FR-12 错误提示。
+
+用法示例::
+
+    bilidl "https://www.bilibili.com/video/BV1xx411c7mD"
+    bilidl BV1xx411c7mD -q 720
+    bilidl <URL> -q 1080 --cookie-file ~/bili-cookies.txt
+    bilidl <URL> --list-qualities
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.padding import Padding
+from rich.table import Table
+
+from . import __version__, quality
+from .api import BiliClient
+from .cookies import is_logged_in, resolve_cookie
+from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
+from .errors import AuthError, BiliError, ExitCode, LinkExpiredError, UsageError
+from .models import Page, PlayUrlData, VideoInfo
+from .muxer import choose_container, find_ffmpeg, merge
+from .naming import TEMPLATE_FIELDS, render_path, template_fields, validate_template
+from .progress import ProgressReporter
+
+app = typer.Typer(
+    add_completion=False,
+    help="B站视频下载器——支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与 ffmpeg 无损合并。",
+)
+
+err_console = Console(stderr=True)
+
+BVID_PATTERN = re.compile(r"(BV[0-9A-Za-z]{10})")
+AID_PATTERN = re.compile(r"(?<![A-Za-z])av(\d{1,12})", re.IGNORECASE)
+SHORT_LINK_PATTERN = re.compile(r"https?://b23\.tv/[0-9A-Za-z]+", re.IGNORECASE)
+PAGE_QUERY_PATTERN = re.compile(r"[?&]p=(\d+)")
+
+DEFAULT_TEMPLATE = "{up}/{title}"
+
+
+# --------------------------------------------------------------------------- #
+# 输入解析（FR-01）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class Target:
+    bvid: str | None = None
+    aid: int | None = None
+    page: int | None = None
+
+
+def parse_target_text(text: str) -> Target:
+    """从链接、BV 号或 av 号里解析出稿件标识与可选分P。"""
+    raw = text.strip()
+    if not raw:
+        raise UsageError("请提供视频链接、BV 号或 av 号")
+
+    page_match = PAGE_QUERY_PATTERN.search(raw)
+    page = int(page_match.group(1)) if page_match else None
+
+    bvid_match = BVID_PATTERN.search(raw)
+    if bvid_match:
+        return Target(bvid=bvid_match.group(1), page=page)
+
+    aid_match = AID_PATTERN.search(raw)
+    if aid_match:
+        return Target(aid=int(aid_match.group(1)), page=page)
+
+    raise UsageError(
+        f"无法从输入中识别出视频：{text}",
+        hint="支持的形式：https://www.bilibili.com/video/BV1xx411c7mD、BV1xx411c7mD、av12345、https://b23.tv/xxxx",
+    )
+
+
+async def resolve_target(client: BiliClient, text: str) -> Target:
+    """解析输入；遇到 b23.tv 短链先跟一次跳转。"""
+    raw = text.strip()
+    short_match = SHORT_LINK_PATTERN.search(raw)
+    if short_match:
+        try:
+            response = await client.http.get(short_match.group(0), follow_redirects=True)
+        except Exception as exc:  # 网络异常在这里不值得中断，回落到直接解析
+            logging.getLogger("bilidl").debug("短链解析失败：%s", exc)
+        else:
+            resolved = str(response.url)
+            if BVID_PATTERN.search(resolved) or AID_PATTERN.search(resolved):
+                return parse_target_text(resolved)
+        raise UsageError(
+            f"短链跳转后仍无法识别视频：{short_match.group(0)}",
+            hint="请改用完整的视频链接",
+        )
+    return parse_target_text(raw)
+
+
+def parse_page_spec(spec: str, total: int) -> list[int]:
+    """解析 ``-p``：单个序号、``1-3``、``1,3,5`` 或 ``all``。"""
+    text = spec.strip().lower()
+    if text in {"all", "*"}:
+        return list(range(1, total + 1))
+
+    indexes: list[int] = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            start_text, _, end_text = chunk.partition("-")
+            start = int(start_text) if start_text.strip().isdigit() else 1
+            end = int(end_text) if end_text.strip().isdigit() else total
+            indexes.extend(range(start, end + 1))
+        elif chunk.isdigit():
+            indexes.append(int(chunk))
+        else:
+            raise UsageError(
+                f"无法解析分P表达式：{spec}",
+                hint="示例：-p 3 / -p 1-3 / -p 1,3,5 / -p all",
+            )
+
+    ordered = sorted(set(indexes))
+    invalid = [index for index in ordered if index < 1 or index > total]
+    if invalid:
+        raise UsageError(
+            f"分P序号超出范围：{', '.join(str(i) for i in invalid)}",
+            hint=f"该稿件共有 {total} 个分P",
+        )
+    return ordered or [1]
+
+
+def select_pages(info: VideoInfo, page_option: str | None, url_page: int | None) -> tuple[list[Page], int]:
+    """决定下载哪些分P。优先级：``-p`` > 链接里的 ``?p=`` > 第 1 P。"""
+    pages = info.page_list()
+    if page_option:
+        indexes = parse_page_spec(page_option, len(pages))
+        return [pages[index - 1] for index in indexes], indexes[0]
+
+    wanted = url_page or 1
+    if wanted < 1 or wanted > len(pages):
+        raise UsageError(
+            f"链接里的分P序号超范围：p={wanted}",
+            hint=f"该稿件共有 {len(pages)} 个分P",
+        )
+    return [pages[wanted - 1]], wanted
+
+
+# --------------------------------------------------------------------------- #
+# 展示（FR-02）
+# --------------------------------------------------------------------------- #
+
+
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def print_video_info(
+    console: Console,
+    info: VideoInfo,
+    *,
+    logged_in: bool,
+    cookie_source: str | None,
+    pages: list[Page],
+) -> None:
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    table.add_column(style="bold cyan", justify="right")
+    table.add_column()
+
+    table.add_row("标题", info.title or "(无标题)")
+    table.add_row("BV 号", f"{info.bvid}　(av{info.aid})" if info.bvid else f"av{info.aid}")
+    table.add_row("UP 主", f"{info.owner.name}　(UID {info.owner.mid})")
+    table.add_row("时长", format_duration(info.duration))
+    if len(info.page_list()) > 1:
+        table.add_row("分P", f"共 {len(info.page_list())} P")
+    table.add_row("发布", time.strftime("%Y-%m-%d %H:%M", time.localtime(info.pubdate)) if info.pubdate else "未知")
+
+    if logged_in:
+        table.add_row("登录态", f"[green]已登录[/green]（来源：{cookie_source}）")
+    else:
+        table.add_row("登录态", "[yellow]未登录[/yellow]　最高只能下载 480P")
+
+    if len(pages) <= 5:
+        table.add_row("本次下载", "、".join(f"P{page.page}" for page in pages))
+    else:
+        table.add_row("本次下载", f"P{pages[0].page} ~ P{pages[-1].page}（共 {len(pages)} P）")
+
+    console.print(table)
+
+
+def _tier_reason(tier: quality.PermissionTier, logged_in: bool) -> str:
+    if tier == "vip":
+        return "需要大会员" + ("" if logged_in else "（且当前未登录）")
+    if tier == "login":
+        return "需要登录" + ("" if logged_in else "　← 当前未登录，提供 Cookie 即可解锁")
+    return "当前账号不可用"
+
+
+def print_qualities(
+    console: Console,
+    data: PlayUrlData,
+    streams: list[quality.VideoStream],
+    *,
+    preference: tuple[str, ...],
+    logged_in: bool,
+) -> None:
+    """``--list-qualities``：如实区分"视频提供"与"当前账号能拿"。"""
+    console.print()
+    console.print("[bold]当前账号实际可下载[/bold]")
+    if streams:
+        for line in quality.describe_available(streams, preference):
+            console.print(f"  [green]✓[/green] {line}")
+    else:
+        console.print("  [yellow]没有可用的 DASH 视频流[/yellow]")
+
+    catalog = sorted({qn for qn in (data.accept_quality or []) if qn in quality.QUALITY_NAMES}, reverse=True)
+    if catalog:
+        granted = {stream.qn for stream in streams}
+        console.print()
+        console.print("[bold]该视频提供的全部档位[/bold]")
+        for qn in catalog:
+            name = quality.QUALITY_NAMES[qn]
+            if qn in granted:
+                console.print(f"  [green]✓[/green] {name}（qn={qn}）")
+            else:
+                reason = _tier_reason(quality.required_tier(qn), logged_in)
+                console.print(f"  [dim]· {name}（qn={qn}）　{reason}[/dim]")
+    console.print()
+
+
+# --------------------------------------------------------------------------- #
+# 下载流程
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Options:
+    url: str
+    quality: str = "max"
+    on_unavailable: str = "degrade"
+    codec: str | None = None
+    codec_compat: bool = False
+    audio_quality: str = "auto"
+    audio_only: bool = False
+    container: str = "mp4"
+    output: Path = field(default_factory=lambda: Path("downloads"))
+    template: str = DEFAULT_TEMPLATE
+    page: str | None = None
+    cookie: str | None = None
+    cookie_file: Path | None = None
+    concurrency: int = DEFAULT_CONCURRENCY
+    limit_rate: str | None = None
+    retries: int = 3
+    list_qualities: bool = False
+    info_only: bool = False
+    check: bool = False
+    overwrite: bool = False
+    keep_parts: bool = False
+    no_merge: bool = False
+    quiet: bool = False
+    debug: bool = False
+
+
+def _validate(options: Options) -> tuple[quality.QualityRequest, tuple[str, ...], float | None]:
+    request = quality.parse_quality(options.quality)
+    preference = quality.parse_codec_preference(options.codec, compat=options.codec_compat)
+    validate_template(options.template)
+
+    if options.on_unavailable not in {"degrade", "fail"}:
+        raise UsageError(
+            f"--on-unavailable 只接受 degrade 或 fail，收到：{options.on_unavailable}",
+            hint="degrade（默认）自动降级并提示；fail 严格匹配，档位不可用时报错退出",
+        )
+    if options.container.lower() not in {"mp4", "mkv"}:
+        raise UsageError(
+            f"--container 只接受 mp4 或 mkv，收到：{options.container}",
+        )
+
+    rate = parse_rate(options.limit_rate)
+    if options.limit_rate and rate is None:
+        raise UsageError(
+            f"无法解析限速值：{options.limit_rate}",
+            hint="示例：--limit-rate 1M / 500K / 800000",
+        )
+    return request, preference, rate
+
+
+async def _playurl(client: BiliClient, bvid: str, cid: int, qn: int) -> PlayUrlData:
+    """取播放地址；WBI 签名失效（-403）时刷新密钥重试一次。"""
+    try:
+        return await client.playurl(bvid=bvid, cid=cid, qn=qn)
+    except Exception as exc:
+        from .errors import AuthError
+
+        if isinstance(exc, AuthError):
+            logging.getLogger("bilidl").debug("playurl 返回权限错误，刷新 WBI 后重试")
+            client.invalidate_wbi()
+            return await client.playurl(bvid=bvid, cid=cid, qn=qn)
+        raise
+
+
+async def _download_stream(
+    downloader: StreamDownloader,
+    *,
+    urls: tuple[str, ...],
+    size: int | None,
+    dest: Path,
+    refresh,
+    on_progress,
+    on_total,
+    label: str,
+) -> Path:
+    """下载一条流；链接过期时调用 ``refresh`` 换链后带着同一份断点继续（FR-04.3）。"""
+    try:
+        return await downloader.download(urls, dest, on_progress=on_progress, on_total=on_total, total_hint=size)
+    except LinkExpiredError:
+        logging.getLogger("bilidl").info("%s 的下载链接已过期，正在自动换链", label)
+        fresh_urls, fresh_size = await refresh()
+        return await downloader.download(
+            fresh_urls, dest, on_progress=on_progress, on_total=on_total, total_hint=fresh_size
+        )
+
+
+def build_fields(info: VideoInfo, page: Page, *, qn: int, label: str) -> dict[str, object]:
+    published = info.pubdate or 0
+    return {
+        "title": info.title,
+        "bvid": info.bvid,
+        "aid": info.aid,
+        "p": page.page,
+        "p_name": page.part,
+        "up": info.owner.name,
+        "mid": info.owner.mid,
+        "qn": qn,
+        "quality": label,
+        "date": time.strftime("%Y%m%d", time.localtime(published)) if published else "00000000",
+        "datetime": time.strftime("%Y%m%d_%H%M%S", time.localtime(published)) if published else "00000000_000000",
+    }
+
+
+async def process_page(
+    client: BiliClient,
+    downloader: StreamDownloader,
+    *,
+    info: VideoInfo,
+    page: Page,
+    options: Options,
+    request: quality.QualityRequest,
+    preference: tuple[str, ...],
+    template: str,
+    logged_in: bool,
+    progress: ProgressReporter,
+    console: Console,
+) -> Path | None:
+    """下载并合并单个分P，返回产物路径（跳过时返回 ``None``）。"""
+    bvid = info.bvid
+    stream = None
+    if options.audio_only:
+        # 只要音频时不去协商视频清晰度：否则 `--on-unavailable fail` 会因为视频档位
+        # 拿不到而中止一次纯音频下载——用户根本没要视频。顺带用最高档请求，
+        # 这样能拿到该账号权限内最好的音轨。
+        qn = quality.MAX_QN
+        data = await _playurl(client, bvid, page.cid, qn)
+        audio_streams = quality.to_audio_streams(data)
+    else:
+        qn = quality.qn_for_request(request)
+        data = await _playurl(client, bvid, page.cid, qn)
+        audio_streams = quality.to_audio_streams(data)
+
+        selection = quality.select_video(
+            quality.to_video_streams(data),
+            request,
+            granted_qn=qn,
+            preference=preference,
+            on_unavailable=options.on_unavailable,
+            accept_quality=data.accept_quality,
+            logged_in=logged_in,
+        )
+        stream = selection.stream
+
+        if selection.notice:
+            style = "yellow" if selection.degraded else "dim"
+            marker = "⚠" if selection.degraded else "ℹ"
+            console.print(f"  [{style}]{marker} {selection.notice}[/{style}]")
+
+    audio = quality.select_audio(audio_streams, want=options.audio_quality)
+    if options.audio_only and audio is None:
+        raise UsageError(f"P{page.page} 没有可用的音轨，无法只下载音频")
+
+    container, warning = choose_container(
+        options.container,
+        video_codec=stream.codec if stream else None,
+        audio_codec=audio.codecs if audio else None,
+    )
+    if warning:
+        console.print(f"  [yellow]⚠ {warning}[/yellow]")
+
+    # 目标路径与临时流文件（都放在最终目录里，断点文件才不会被当成垃圾清掉）
+    # 纯音频时没有视频流，模板里的 {qn}/{quality} 就如实反映音轨规格。
+    fields = build_fields(
+        info,
+        page,
+        qn=stream.qn if stream else (audio.qn if audio else qn),
+        label=stream.label if stream else (audio.label if audio else "音频"),
+    )
+    relative = render_path(template, fields)
+    if options.audio_only:
+        # Hi-Res 音轨是 FLAC，装进 .m4a 会误导播放器
+        suffix = ".flac" if audio is not None and audio.codecs.startswith("flac") else ".m4a"
+    else:
+        suffix = f".{container}"
+    dest = options.output / relative
+    dest = dest.parent / (dest.name + suffix)
+    stem = dest.parent / dest.stem
+
+    if dest.exists() and not options.overwrite:
+        console.print(f"  [dim]⏭ 已存在，跳过：{dest}[/dim]（加 --overwrite 可重新下载）")
+        return None
+
+    video_temp = stem.with_name(stem.name + ".video.m4s")
+    audio_temp = stem.with_name(stem.name + ".audio.m4s")
+
+    with progress:
+        if options.audio_only:
+            assert audio is not None
+            task = progress.add(f"P{page.page} 音轨 {audio.label}", total=audio.size)
+            await _download_stream(
+                downloader,
+                urls=audio.urls,
+                size=audio.size,
+                dest=dest,
+                refresh=lambda: _refresh_audio(client, bvid, page.cid, qn, options, preference),
+                on_progress=lambda n, t=task: progress.advance(t, n),
+                on_total=lambda total, t=task: progress.set_total(t, total),
+                label="音轨",
+            )
+            progress.complete(task)
+            console.print(f"  [green]✓[/green] {dest}")
+            return dest
+
+        # 视频与音频各用一条进度条：接口给的 size 未必存在，要靠探测到的真实长度
+        # 校正；两条流合用一条进度条，总数永远算不准（会显示成 8.8/? MB）。
+        if options.overwrite or not video_temp.exists() or (
+            stream.size and video_temp.stat().st_size != stream.size
+        ):
+            task = progress.add(f"P{page.page} 视频 {stream.label}", total=stream.size)
+            await _download_stream(
+                downloader,
+                urls=stream.urls,
+                size=stream.size,
+                dest=video_temp,
+                refresh=lambda: _refresh_video(client, bvid, page.cid, qn, request, preference, options, logged_in),
+                on_progress=lambda n, t=task: progress.advance(t, n),
+                on_total=lambda total, t=task: progress.set_total(t, total),
+                label="视频流",
+            )
+            progress.complete(task)
+
+        if audio is not None and (
+            options.overwrite
+            or not audio_temp.exists()
+            or (audio.size and audio_temp.stat().st_size != audio.size)
+        ):
+            task = progress.add(f"P{page.page} 音轨 {audio.label}", total=audio.size)
+            await _download_stream(
+                downloader,
+                urls=audio.urls,
+                size=audio.size,
+                dest=audio_temp,
+                refresh=lambda: _refresh_audio(client, bvid, page.cid, qn, options, preference),
+                on_progress=lambda n, t=task: progress.advance(t, n),
+                on_total=lambda total, t=task: progress.set_total(t, total),
+                label="音轨",
+            )
+            progress.complete(task)
+
+    if options.no_merge:
+        console.print(f"  [green]✓[/green] 已下载分片（--no-merge 未合并）：{video_temp}")
+        return video_temp
+
+    output = await merge(
+        video=video_temp,
+        audio=audio_temp if audio is not None else None,
+        dest=dest,
+        container=container,
+        video_codec=stream.codec if stream else None,
+    )
+
+    if not options.keep_parts:
+        video_temp.unlink(missing_ok=True)
+        audio_temp.unlink(missing_ok=True)
+
+    size_mb = output.stat().st_size / 1024 / 1024
+    console.print(f"  [green]✓[/green] {output}　[dim]({size_mb:.1f} MB)[/dim]")
+    return output
+
+
+async def _refresh_video(
+    client: BiliClient,
+    bvid: str,
+    cid: int,
+    qn: int,
+    request: quality.QualityRequest,
+    preference: tuple[str, ...],
+    options: Options,
+    logged_in: bool,
+) -> tuple[tuple[str, ...], int | None]:
+    data = await _playurl(client, bvid, cid, qn)
+    selection = quality.select_video(
+        quality.to_video_streams(data),
+        request,
+        granted_qn=qn,
+        preference=preference,
+        on_unavailable=options.on_unavailable,
+        accept_quality=data.accept_quality,
+        logged_in=logged_in,
+    )
+    return selection.stream.urls, selection.stream.size
+
+
+async def _refresh_audio(
+    client: BiliClient,
+    bvid: str,
+    cid: int,
+    qn: int,
+    options: Options,
+    preference: tuple[str, ...],
+) -> tuple[tuple[str, ...], int | None]:
+    data = await _playurl(client, bvid, cid, qn)
+    audio = quality.select_audio(quality.to_audio_streams(data), want=options.audio_quality)
+    if audio is None:
+        raise UsageError("换链后没有找到可用音轨")
+    return audio.urls, audio.size
+
+
+# --------------------------------------------------------------------------- #
+# 环境自检
+# --------------------------------------------------------------------------- #
+
+
+async def run_check(options: Options, console: Console) -> int:
+    """``--check``：确认依赖与登录态，便于安装后第一时间发现问题（对应 E2E-9）。"""
+    ok = True
+
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        console.print(f"[green]✓[/green] ffmpeg：{ffmpeg}")
+    else:
+        ok = False
+        console.print("[red]✗[/red] 未找到 ffmpeg——音视频合并无法进行（退出码 6）")
+        console.print("  [dim]→ macOS: brew install ffmpeg[/dim]")
+
+    cookies, source = resolve_cookie(explicit=options.cookie, cookie_file=options.cookie_file)
+    if is_logged_in(cookies):
+        console.print(f"[green]✓[/green] 登录态：已加载（来源：{source}）")
+    else:
+        console.print("[yellow]·[/yellow] 登录态：未登录，最高只能下载 480P（720P 及以上需要登录）")
+
+    async with BiliClient(cookies=cookies, retries=options.retries) as client:
+        nav = await client.probe_login()
+        if nav is None:
+            ok = False
+            console.print("[red]✗[/red] 无法访问 B站接口（网络不通或接口已变更）")
+        elif nav.isLogin:
+            console.print(f"[green]✓[/green] B站账号：{nav.uname}（UID {nav.mid}）")
+        else:
+            console.print("[yellow]·[/yellow] B站接口可达；当前 Cookie 不是登录态")
+
+    return ExitCode.OK if ok else ExitCode.MISSING_DEPENDENCY
+
+
+# --------------------------------------------------------------------------- #
+# 主流程
+# --------------------------------------------------------------------------- #
+
+
+async def run(options: Options, console: Console) -> int:
+    request, preference, rate = _validate(options)
+
+    if options.check:
+        return await run_check(options, console)
+
+    cookies, cookie_source = resolve_cookie(explicit=options.cookie, cookie_file=options.cookie_file)
+    logged_in = is_logged_in(cookies)
+
+    downloader_limit = rate
+    async with BiliClient(cookies=cookies, retries=options.retries) as client:
+        target = await resolve_target(client, options.url)
+        info = await client.view(bvid=target.bvid, aid=target.aid)
+        pages, _ = select_pages(info, options.page, target.page)
+
+        template = options.template
+        if len(pages) > 1 and "p" not in template_fields(template):
+            # 多P 时不加序号会互相覆盖，这里补一个并说明，而不是静默覆盖
+            template = f"{template}_P{{p:02d}}"
+            console.print(f"[dim]ℹ 多分P 下载，文件名模板自动调整为：{template}[/dim]")
+
+        print_video_info(console, info, logged_in=logged_in, cookie_source=cookie_source, pages=pages)
+
+        qn = quality.qn_for_request(request)
+        console.print(f"[dim]ℹ 请求清晰度：{request.describe()}（qn={qn}）[/dim]")
+
+        if options.list_qualities or options.info_only:
+            data = await _playurl(client, info.bvid, pages[0].cid, qn)
+            if options.list_qualities:
+                print_qualities(console, data, quality.to_video_streams(data), preference=preference, logged_in=logged_in)
+            return ExitCode.OK
+
+        downloader = StreamDownloader(
+            client.http,
+            concurrency=options.concurrency,
+            retries=options.retries,
+            limit_rate=downloader_limit,
+        )
+
+        succeeded: list[Path] = []
+        failures: list[tuple[Page, BiliError]] = []
+        progress = ProgressReporter(console, enabled=not options.quiet)
+
+        for page in pages:
+            console.print(f"\n[bold]▶ P{page.page}[/bold] {page.part or info.title}")
+            try:
+                result = await process_page(
+                    client,
+                    downloader,
+                    info=info,
+                    page=page,
+                    options=options,
+                    request=request,
+                    preference=preference,
+                    template=template,
+                    logged_in=logged_in,
+                    progress=progress,
+                    console=console,
+                )
+            except BiliError as exc:
+                failures.append((page, exc))
+                console.print(f"  [red]✗ {exc.message}[/red]")
+                if exc.hint:
+                    for line in exc.hint.splitlines():
+                        console.print(f"    [dim]{line}[/dim]")
+                continue
+            if result is not None:
+                succeeded.append(result)
+
+    if failures and succeeded:
+        console.print(f"\n[yellow]完成 {len(succeeded)} 个，失败 {len(failures)} 个[/yellow]")
+        return ExitCode.PARTIAL_FAILURE
+    if failures:
+        raise failures[0][1]
+    return ExitCode.OK
+
+
+def configure_logging(debug: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.WARNING,
+        format="%(message)s",
+        handlers=[RichHandler(console=err_console, show_path=False, show_time=False)] if debug else [],
+        force=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Typer 命令
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def cli(
+    url: str = typer.Argument(None, help="视频链接、BV 号、av 号，或 b23.tv 短链"),
+    quality_: str = typer.Option("max", "-q", "--quality", help="清晰度：max / 1080 / 720 / 80 / 116 …"),
+    on_unavailable: str = typer.Option(
+        "degrade", "--on-unavailable", help="档位不可用时：degrade（降级+提示）或 fail（报错退出）"
+    ),
+    codec: str = typer.Option(None, "--codec", help="编码偏好，如 avc,hevc"),
+    codec_compat: bool = typer.Option(False, "--codec-compat", help="优先 AVC(H.264)，兼容性最好"),
+    audio_quality: str = typer.Option("auto", "--audio-quality", help="音轨：auto / best / 30280 …"),
+    audio_only: bool = typer.Option(False, "--audio-only", help="只下载音频，输出 .m4a（不转码）"),
+    container: str = typer.Option("mp4", "--container", help="容器：mp4 或 mkv"),
+    output: Path = typer.Option(Path("downloads"), "-o", "--output", help="输出根目录"),
+    template: str = typer.Option(DEFAULT_TEMPLATE, "--template", help=f"命名模板，可用变量：{', '.join(TEMPLATE_FIELDS)}"),
+    page: str = typer.Option(None, "-p", "--page", help="分P：单个序号、1-3、1,3,5 或 all"),
+    cookie: str = typer.Option(None, "--cookie", help="直接给出 Cookie 字符串"),
+    cookie_file: Path = typer.Option(None, "--cookie-file", help="Cookie 文件（Netscape 或粘贴的一行）"),
+    concurrency: int = typer.Option(DEFAULT_CONCURRENCY, "--concurrency", help="单文件并发分片数"),
+    limit_rate: str = typer.Option(None, "--limit-rate", help="全局限速，如 1M / 500K"),
+    retries: int = typer.Option(3, "--retries", help="网络重试次数"),
+    list_qualities: bool = typer.Option(False, "--list-qualities", help="只列出可用清晰度，不下载"),
+    info_only: bool = typer.Option(False, "--info", help="只显示视频信息，不下载"),
+    check: bool = typer.Option(False, "--check", help="检查 ffmpeg 与登录态后退出"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="覆盖已存在的文件（默认跳过）"),
+    keep_parts: bool = typer.Option(False, "--keep-parts", help="合并后保留 .m4s 分片"),
+    no_merge: bool = typer.Option(False, "--no-merge", help="只下载分片，不调用 ffmpeg 合并"),
+    quiet: bool = typer.Option(False, "-Q", "--quiet", help="不显示进度条"),
+    debug: bool = typer.Option(False, "--debug", help="输出调试日志（会自动脱敏 Cookie）"),
+    version: bool = typer.Option(False, "--version", help="显示版本后退出"),
+) -> None:
+    if version:
+        typer.echo(f"bilidl {__version__}")
+        raise typer.Exit()
+
+    if not url and not check:
+        err_console.print("[red]请提供视频链接，或使用 --check 检查环境[/red]")
+        raise typer.Exit(int(ExitCode.USAGE))
+
+    configure_logging(debug)
+
+    options = Options(
+        url=url or "",
+        quality=quality_,
+        on_unavailable=on_unavailable,
+        codec=codec,
+        codec_compat=codec_compat,
+        audio_quality=audio_quality,
+        audio_only=audio_only,
+        container=container,
+        output=output,
+        template=template,
+        page=page,
+        cookie=cookie,
+        cookie_file=cookie_file,
+        concurrency=concurrency,
+        limit_rate=limit_rate,
+        retries=retries,
+        list_qualities=list_qualities,
+        info_only=info_only,
+        check=check,
+        overwrite=overwrite,
+        keep_parts=keep_parts,
+        no_merge=no_merge,
+        quiet=quiet,
+        debug=debug,
+    )
+
+    code = asyncio.run(run(options, Console()))
+    if code:
+        raise typer.Exit(int(code))
+
+
+def main() -> None:
+    """控制台脚本入口：把领域异常翻译成用户提示与退出码（FR-11 / FR-12）。"""
+    try:
+        app()
+    except BiliError as exc:
+        # 用 Padding 给整块加左缩进：rich 自动折行时，续行才不会顶到第 0 列、
+        # 看起来像另一条独立的消息。
+        err_console.print(Padding(f"[bold red]✗[/bold red] {exc.message}", (0, 0, 0, 2)))
+        if exc.hint:
+            for line in exc.hint.splitlines():
+                err_console.print(Padding(f"[dim]→ {line}[/dim]", (0, 0, 0, 2)))
+        raise SystemExit(int(exc.exit_code)) from None
+    except KeyboardInterrupt:
+        err_console.print(
+            "\n[yellow]已中断。[/yellow]已下载的分片保存在 .part 文件中，"
+            "重新运行同一命令会从断点继续。"
+        )
+        raise SystemExit(130) from None
+
+
+if __name__ == "__main__":
+    main()
