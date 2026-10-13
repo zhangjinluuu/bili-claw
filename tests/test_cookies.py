@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -165,3 +166,27 @@ def test_malformed_cookie_file_keeps_the_format_hint(tmp_path: Path) -> None:
     with pytest.raises(UsageError) as info:
         load_from_file(path)
     assert "Netscape" in (info.value.hint or "")
+
+
+def test_world_readable_cookie_file_is_flagged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Cookie 是长期凭据，同机器上别的账号不该读得到（FR-09.4）。"""
+    path = tmp_path / "cookies.txt"
+    path.write_text("SESSDATA=abc", encoding="utf-8")
+    path.chmod(0o644)
+
+    with caplog.at_level(logging.WARNING, logger="bilidl.cookies"):
+        assert load_from_file(path) == {"SESSDATA": "abc"}
+
+    assert "权限过宽" in caplog.text
+    assert "600" in caplog.text
+
+
+def test_private_cookie_file_is_quiet(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    path = tmp_path / "cookies.txt"
+    path.write_text("SESSDATA=abc", encoding="utf-8")
+    path.chmod(0o600)
+
+    with caplog.at_level(logging.WARNING, logger="bilidl.cookies"):
+        load_from_file(path)
+
+    assert caplog.text == ""

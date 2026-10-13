@@ -9,8 +9,9 @@ import pytest
 from rich.console import Console
 
 from bilidl import cli, quality
-from bilidl.cli import Target, parse_page_spec, parse_target_text
-from bilidl.errors import QualityUnavailableError, UsageError
+from bilidl.cli import Target, build_fields, main, parse_page_spec, parse_target_text, reproduce_command
+from bilidl.errors import AuthError, ExitCode, NetworkError, QualityUnavailableError, UsageError
+from bilidl.models import NavData, Owner, Page, VideoInfo
 
 # --------------------------------------------------------------------------- #
 # 稿件标识
@@ -209,3 +210,100 @@ def test_can_prompt_survives_closed_stdin() -> None:
         assert cli._can_prompt(_console()) is False
     finally:
         sys.stdin = original
+
+
+def test_every_documented_template_variable_is_actually_provided() -> None:
+    """文档里写出来的变量，必须真的给得到。
+
+    这条测试会随着 TEMPLATE_FIELDS 自动生长：以后往文档里加变量却忘了在
+    build_fields 里填，立刻就红——而不是等用户下载完才发现文件名里是个空位。
+    模板变量拼错时 validate_template 会报错，但"变量存在却永远为空"不会。
+    """
+    from bilidl.naming import TEMPLATE_FIELDS
+
+    info = VideoInfo(bvid="BV1xx411c7mD", aid=2, title="标题", pubdate=1700000000, owner=Owner(mid=7, name="UP"))
+    page = Page(cid=62131, page=3, part="第三话", duration=60)
+    fields = build_fields(info, page, qn=80, label="1080P", codec="avc")
+
+    assert set(TEMPLATE_FIELDS) == set(fields)
+    assert fields["cid"] == 62131
+    assert fields["pname"] == "第三话"
+    assert fields["p_name"] == fields["pname"]  # 两个名字都得能用
+    assert fields["codec"] == "avc"
+
+
+def test_reproduce_command_quotes_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD", "-o", "/tmp/my dir"])
+    assert reproduce_command() == "bilidl BV1xx411c7mD -o '/tmp/my dir'"
+
+
+def test_reproduce_command_redacts_cookie_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-11.5 请用户把命令粘出来求助，FR-09 又不许凭据出现在输出里——两者会打架。"""
+    monkeypatch.setattr(
+        sys, "argv", ["bilidl", "BV1xx411c7mD", "--cookie", "SESSDATA=secret123; bili_jct=abc456"]
+    )
+    command = reproduce_command()
+    assert "secret123" not in command
+    assert "abc456" not in command
+    assert "SESSDATA=***" in command
+
+
+def test_failure_prints_a_rerun_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD"])
+
+    def _boom() -> None:
+        raise NetworkError("下载中断")
+
+    monkeypatch.setattr(cli, "app", _boom)
+    with pytest.raises(SystemExit) as caught:
+        main()
+    assert caught.value.code == int(ExitCode.NETWORK)
+    assert "重跑：bilidl BV1xx411c7mD" in capsys.readouterr().err
+
+
+def test_usage_error_does_not_suggest_rerunning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """参数错了就再跑一遍同一个命令，只会得到同一个错误。"""
+    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD", "-q", "99999"])
+
+    def _boom() -> None:
+        raise UsageError("无法识别的清晰度：99999")
+
+    monkeypatch.setattr(cli, "app", _boom)
+    with pytest.raises(SystemExit):
+        main()
+    assert "重跑" not in capsys.readouterr().err
+
+
+class _ProbeOnlyClient:
+    """只够 `_reject_expired_cookie` 用的假客户端。"""
+
+    def __init__(self, nav: NavData | None) -> None:
+        self._nav = nav
+
+    async def probe_login(self) -> NavData | None:
+        return self._nav
+
+
+async def test_expired_cookie_is_named_as_expired_not_as_a_bad_video() -> None:
+    """服务端拒掉凭据后，playurl 会返回 quality=0 且 dash=None。
+
+    不先查登录态的话，用户看到的是「该视频没有可用的 DASH 视频流」——一句把矛头
+    指向视频、真正的问题却在凭据上的话（FR-09 明确要求提示登录已过期）。
+    """
+    with pytest.raises(AuthError) as caught:
+        await cli._reject_expired_cookie(_ProbeOnlyClient(NavData(isLogin=False)), "--cookie")
+
+    assert caught.value.exit_code == ExitCode.AUTH
+    assert "失效" in caught.value.message
+    assert "SESSDATA" in (caught.value.hint or "")
+
+
+async def test_login_probe_failure_does_not_claim_the_cookie_expired() -> None:
+    """探不到登录态时不断言：网络抖动不该被说成凭据过期，那会让人白换一次 Cookie。"""
+    await cli._reject_expired_cookie(_ProbeOnlyClient(None), "--cookie")
+
+
+async def test_valid_cookie_passes_the_gate() -> None:
+    await cli._reject_expired_cookie(_ProbeOnlyClient(NavData(isLogin=True, uname="某人")), "--cookie")

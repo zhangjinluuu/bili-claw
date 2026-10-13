@@ -94,6 +94,25 @@ def _name_and_value(fields: list[str]) -> tuple[str, str]:
     return "", ""
 
 
+def _warn_if_world_readable(path: Path) -> None:
+    """Cookie 是长期凭据，别让同机器上的其他账号读走（FR-09.4）。
+
+    只提醒不拒绝：文件已经在那儿了，拒绝加载只会让用户卡住，而权限松紧是他自己的
+    选择（比如放在只有自己能进的目录里）。
+    """
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        log.warning(
+            "Cookie 文件权限过宽（%s）：%s。建议 chmod 600 %s",
+            oct(mode & 0o777),
+            path,
+            path,
+        )
+
+
 def load_from_file(path: Path) -> dict[str, str]:
     """读取 Cookie 文件，自动识别 Netscape 格式（两种列序）与单行 Cookie 头格式。"""
     try:
@@ -102,6 +121,8 @@ def load_from_file(path: Path) -> dict[str, str]:
         raise UsageError(f"Cookie 文件不存在：{path}") from exc
     except OSError as exc:
         raise UsageError(f"无法读取 Cookie 文件：{path}（{exc.strerror}）") from exc
+
+    _warn_if_world_readable(path)
 
     # 空文件要先单独说清楚。否则会落到下面"没解析出任何字段"的分支，把人引去查格式——
     # 而真正的原因是内容根本没写进去（编辑器新建了文件、但粘贴没成功）。

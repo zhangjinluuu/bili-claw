@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import sys
 import time
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ from rich.table import Table
 
 from . import __version__, quality
 from .api import BiliClient
-from .cookies import is_logged_in, resolve_cookie
+from .cookies import is_logged_in, redact, resolve_cookie
 from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
 from .errors import (
     AuthError,
@@ -346,18 +347,23 @@ async def _download_stream(
         )
 
 
-def build_fields(info: VideoInfo, page: Page, *, qn: int, label: str) -> dict[str, object]:
+def build_fields(info: VideoInfo, page: Page, *, qn: int, label: str, codec: str = "") -> dict[str, object]:
     published = info.pubdate or 0
     return {
         "title": info.title,
         "bvid": info.bvid,
         "aid": info.aid,
+        "cid": page.cid,
         "p": page.page,
         "p_name": page.part,
+        # 需求文档 FR-07.1 写的是 {pname}，README 里已经发布了 {p_name}——
+        # 两个都给，免得改坏已经写进文档和脚本里的模板。
+        "pname": page.part,
         "up": info.owner.name,
         "mid": info.owner.mid,
         "qn": qn,
         "quality": label,
+        "codec": codec,
         "date": time.strftime("%Y%m%d", time.localtime(published)) if published else "00000000",
         "datetime": time.strftime("%Y%m%d_%H%M%S", time.localtime(published)) if published else "00000000_000000",
     }
@@ -508,6 +514,7 @@ async def process_page(
         page,
         qn=stream.qn if stream else (audio.qn if audio else qn),
         label=stream.label if stream else (audio.label if audio else "音频"),
+        codec=stream.codec if stream else (audio.codecs.split(".")[0] if audio else ""),
     )
     relative = render_path(template, fields)
     if options.audio_only:
@@ -724,6 +731,29 @@ async def run_check(options: Options, console: Console) -> int:
 # --------------------------------------------------------------------------- #
 
 
+async def _reject_expired_cookie(client: BiliClient, source: str) -> None:
+    """带了 Cookie 却不是登录态，就明确说「登录已过期」并停下（FR-09）。
+
+    不这么做的话，服务端拒绝了这个凭据后 ``playurl`` 会返回 ``quality=0``、
+    ``dash=None``，用户看到的是"该视频没有可用的 DASH 视频流"——一句把矛头指向
+    视频、而真正的问题在自己凭据上的话。更糟的情况是它悄悄以未登录身份下载，
+    用户以为拿到了 1080P、其实只有 480P。
+
+    与 ``--check`` 的判断保持一致：同样是"读到了 Cookie，但 B站不认"。
+    """
+    nav = await client.probe_login()
+    if nav is None or nav.isLogin:
+        # 探测不到就不断言：网络抖动不该被说成凭据过期
+        return
+    raise AuthError(
+        f"Cookie 已失效（来源：{source}）——B站不认为这是登录态",
+        hint=(
+            "多半是 SESSDATA 过期了。重新登录B站并复制一份新的 Cookie 覆盖它；\n"
+            "或者去掉这个 Cookie 改用未登录下载（最高 480P）"
+        ),
+    )
+
+
 async def run(options: Options, console: Console) -> int:
     request, preference, rate = _validate(options)
 
@@ -735,6 +765,8 @@ async def run(options: Options, console: Console) -> int:
 
     downloader_limit = rate
     async with BiliClient(cookies=cookies, retries=options.retries) as client:
+        if cookie_source is not None:
+            await _reject_expired_cookie(client, cookie_source)
         target = await resolve_target(client, options.url)
         info = await client.view(bvid=target.bvid, aid=target.aid)
         pages, _ = select_pages(info, options.page, target.page)
@@ -791,19 +823,27 @@ async def run(options: Options, console: Console) -> int:
                 )
             except BiliError as exc:
                 failures.append((page, exc))
-                console.print(f"  [red]✗ {exc.message}[/red]")
+                err_console.print(f"  [red]✗ {exc.message}[/red]")
                 if exc.hint:
                     for line in exc.hint.splitlines():
-                        console.print(f"    [dim]{line}[/dim]")
+                        err_console.print(f"    [dim]{line}[/dim]")
                 continue
             if result is not None:
                 succeeded.append(result)
 
     if failures and succeeded:
         console.print(f"\n[yellow]完成 {len(succeeded)} 个，失败 {len(failures)} 个[/yellow]")
+        # 未完成的那几个还得再跑一次，给条能直接粘贴的命令（FR-11.5）
+        console.print(f"[dim]→ 重跑：{reproduce_command()}[/dim]")
         return ExitCode.PARTIAL_FAILURE
     if failures:
-        raise failures[0][1]
+        # 每个分P 刚刚已经各自报过一次错，这里不再把第一条重打一遍——同一个错误
+        # 连着出现两次，看起来像两个互不相干的问题。只补上重跑命令并交出退出码。
+        first = failures[0][1]
+        if first.exit_code != ExitCode.USAGE:
+            # 参数错了就再跑一遍同一个命令，只会得到同一个错误
+            console.print(f"[dim]→ 重跑：{reproduce_command()}[/dim]")
+        return first.exit_code
     return ExitCode.OK
 
 
@@ -903,6 +943,18 @@ def cli(
         raise typer.Exit(int(code))
 
 
+def reproduce_command() -> str:
+    """把这次调用的参数原样拼回一条可粘贴的命令（FR-11.5）。
+
+    直接读 ``sys.argv``，而不是从解析后的 options 反向拼装：反向拼装会漏掉所有
+    "没写就等于默认值"的选项，拼出来的是看起来一样、语义却可能不同的另一条命令。
+
+    整条命令要过一遍 :func:`redact`——``--cookie`` 的值就在 argv 里，原样回显会把
+    凭据写进终端回滚缓冲，以及任何重定向过去的日志文件。
+    """
+    return redact(" ".join(["bilidl", *(shlex.quote(part) for part in sys.argv[1:])]))
+
+
 def main() -> None:
     """控制台脚本入口：把领域异常翻译成用户提示与退出码（FR-11 / FR-12）。"""
     try:
@@ -914,6 +966,10 @@ def main() -> None:
         if exc.hint:
             for line in exc.hint.splitlines():
                 err_console.print(Padding(f"[dim]→ {line}[/dim]", (0, 0, 0, 2)))
+        # 参数类错误不给重跑命令：照着原样再跑一遍只会得到同一个错误，
+        # 用户要做的是改参数，不是重试。
+        if exc.exit_code != ExitCode.USAGE:
+            err_console.print(Padding(f"[dim]→ 重跑：{reproduce_command()}[/dim]", (0, 0, 0, 2)))
         raise SystemExit(int(exc.exit_code)) from None
     except KeyboardInterrupt:
         err_console.print(
