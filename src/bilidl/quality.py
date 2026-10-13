@@ -541,11 +541,16 @@ def select_video(
         )
 
     key = _sort_key(preference)
-    ceiling = nominal_height(granted_qn)
 
-    # 正常情况下返回的流高度就等于请求档位的高度；若B站给了更高的（理论上不该发生），
-    # 按"不超过"的语义把它排除掉，避免 `-q 720` 拿到 1080P。
-    within_ceiling = [stream for stream in streams if not ceiling or stream.height <= ceiling]
+    # 只保留不超过请求档位的流。接口返回的是**账号权限内的整条阶梯**，并不按我们请求
+    # 的 qn 截断——实测请求 720P 时 1080P 的流同样在列表里，所以这一层过滤是必须的，
+    # 否则 `-q 720` 会悄悄下成 1080P。
+    #
+    # 判据用 qn 而不是像素高度。qn 的数值本身就是清晰度顺序（6<16<32<64<74<80<100<
+    # 112<116<120<125<126<127）。用像素高度会踩竖屏的坑：竖屏视频的 height 是长边，
+    # 1080P 竖屏报的是 1080x1440，`1440 <= 1080` 不成立，于是 1080P 流被自己筛掉，
+    # 用户永远拿不到 1080P。
+    within_ceiling = [stream for stream in streams if stream.qn <= granted_qn]
     candidates = within_ceiling or list(streams)
     best = max(candidates, key=key)
 
@@ -563,7 +568,9 @@ def select_video(
     # 明确请求了档位：按"用户真正在意的维度"判定降级
     if request.kind == "height":
         assert request.target is not None
-        degraded = best.height < request.target
+        # 比标称高度而不是像素高度：竖屏视频的像素高度是长边，9:16 的 480P 报的是
+        # 480x854，拿 854 去比 720 会得出"没降级"，把 720P 请求悄悄降成 480P。
+        degraded = nominal_height(best.qn) < request.target
         detail = f"请求的 {request.target}P 不可用，已降级为 {best.label}"
     else:
         degraded = best.qn != granted_qn

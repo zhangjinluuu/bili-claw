@@ -6,7 +6,9 @@
   与文件大小无关（FR-04.7）。
 * **断点续传**——下载中的文件叫 ``xxx.part``，旁边有一个 ``xxx.part.json``
   记录总长度、分片大小与已完成的分片号。进程被杀掉后重跑同一命令，
-  校验长度一致就只补缺失的分片（FR-04.2）。
+  校验长度一致就只补缺失的分片（FR-04.2）。元数据里还记着这条流的身份
+  （``identity``：cid+qn+codecid），换清晰度或换编码重跑时宁可重下，
+  也不能把上一条流的前半段当成这条流的（FR-04.6）。
 * **换链**——CDN 链接约 2 小时过期，过期时返回 403。这里把它翻译成
   ``LinkExpiredError`` 抛给上层，由上层重新请求 playurl 拿到新地址后
   带着同一份 ``.part`` 继续（FR-04.3）。
@@ -24,7 +26,7 @@ from pathlib import Path
 
 import httpx
 
-from .errors import BiliError, LinkExpiredError, NetworkError
+from .errors import BiliError, FileSystemError, LinkExpiredError, NetworkError
 
 log = logging.getLogger("bilidl.downloader")
 
@@ -161,16 +163,25 @@ class StreamDownloader:
         on_progress: ProgressCallback | None = None,
         on_total: ProgressCallback | None = None,
         total_hint: int | None = None,
+        identity: str | None = None,
     ) -> Path:
         """把 ``urls`` 指向的流下载到 ``dest``（原子完成：先在 .part 上写，最后改名）。
 
         ``on_total`` 在探测到真实长度后回调一次，供进度条校正总数
         （接口给的 ``size`` 字段并非总是存在）。
+
+        ``identity`` 标识这条流的身份（cid+qn+codecid）。断点元数据会把它一起
+        记下来，重跑时若身份对不上就当作全新下载——否则换了清晰度重跑，
+        上一条流已经下好的前半段会被当成这条流的，产出一个前半段来自 480P、
+        后半段来自 1080P 的文件并且报告成功。
         """
         if not urls:
             raise NetworkError("没有可用的下载地址")
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise _filesystem_error(exc, "创建输出目录", dest.parent) from exc
         part, sidecar = _part_paths(dest)
 
         url, total, supports_range = await self._probe(urls, total_hint)
@@ -182,9 +193,24 @@ class StreamDownloader:
         if not supports_range or total <= 0:
             await self._download_whole(url, part, total, on_progress)
         else:
-            await self._download_chunked(urls, part, sidecar, total, on_progress)
+            await self._download_chunked(urls, part, sidecar, total, on_progress, identity)
 
-        part.replace(dest)
+        # 收尾前再确认一次长度：分片逻辑已经各自校验过，但这里是最后一道闸门，
+        # 宁可重下也不能把长度不对的文件改名成"成功"。
+        try:
+            actual = part.stat().st_size
+        except OSError as exc:
+            raise _filesystem_error(exc, "读取临时文件", part) from exc
+        if total > 0 and actual != total:
+            raise NetworkError(
+                f"下载结果长度不符：期望 {total} 字节，实际 {actual}",
+                hint="重跑会重新下载；若反复出现请加 --debug 反馈",
+            )
+
+        try:
+            part.replace(dest)
+        except OSError as exc:
+            raise _filesystem_error(exc, "写入输出文件", dest) from exc
         sidecar.unlink(missing_ok=True)
         return dest
 
@@ -207,12 +233,23 @@ class StreamDownloader:
                 if response.status_code == 206:
                     total = _total_from_content_range(response.headers.get("content-range"))
                     if total:
+                        if total_hint and total_hint != total:
+                            log.debug(
+                                "接口声明的长度 %d 与 CDN 的 %d 不一致，以 CDN 为准", total_hint, total
+                            )
                         return url, total, True
+                    if total_hint:
+                        # CDN 没给可解析的总长时退回到接口声明的长度，至少还能校验字节数
+                        log.debug("Content-Range 无法解析，改用接口声明的长度 %d", total_hint)
+                        return url, total_hint, True
                     last_error = NetworkError("CDN 返回的 Content-Range 无法解析")
                 elif response.status_code == 200:
                     length = response.headers.get("content-length")
                     if length and int(length) > 0:
                         return url, int(length), False
+                    if total_hint:
+                        log.debug("CDN 未返回长度，改用接口声明的长度 %d", total_hint)
+                        return url, total_hint, False
                     last_error = NetworkError("CDN 未返回文件长度")
                 elif response.status_code == 403:
                     expired = True
@@ -233,19 +270,43 @@ class StreamDownloader:
     async def _download_whole(
         self, url: str, part: Path, total: int, on_progress: ProgressCallback | None
     ) -> None:
-        async with self._client.stream("GET", url) as response:
-            if response.status_code == 403:
-                raise LinkExpiredError("CDN 链接已失效（HTTP 403）", hint="将自动重新获取播放地址")
-            if response.status_code != 200:
-                raise NetworkError(f"下载失败：HTTP {response.status_code}")
+        written = 0
+        try:
+            async with self._client.stream("GET", url) as response:
+                if response.status_code == 403:
+                    raise LinkExpiredError("CDN 链接已失效（HTTP 403）", hint="将自动重新获取播放地址")
+                if response.status_code != 200:
+                    raise NetworkError(f"下载失败：HTTP {response.status_code}")
 
-            with open(part, "wb") as handle:
-                async for block in response.aiter_bytes(_READ_BLOCK):
-                    handle.write(block)
-                    if on_progress:
-                        on_progress(len(block))
-                    if self._limiter:
-                        await self._limiter.consume(len(block))
+                try:
+                    handle = open(part, "wb")
+                except OSError as exc:
+                    raise _filesystem_error(exc, "写入临时文件", part) from exc
+
+                with handle:
+                    async for block in response.aiter_bytes(_READ_BLOCK):
+                        try:
+                            handle.write(block)
+                        except OSError as exc:
+                            raise _filesystem_error(exc, "写入", part) from exc
+                        written += len(block)
+                        if on_progress:
+                            on_progress(len(block))
+                        if self._limiter:
+                            await self._limiter.consume(len(block))
+        except httpx.TransportError as exc:
+            # 连接中途断掉时 httpx 抛的是它自己的异常。不翻译的话用户看到的是一段
+            # Python 堆栈，而 FR-11 要求这种情况退出码 3、FR-12 要求不出无关堆栈。
+            raise NetworkError(
+                f"下载中断：{exc.__class__.__name__}",
+                hint="网络不稳定，重跑会从断点继续",
+            ) from exc
+
+        if total > 0 and written != total:
+            raise NetworkError(
+                f"下载不完整：期望 {total} 字节，实际 {written}",
+                hint="重跑会从断点继续",
+            )
 
     # -- 分片下载 ---------------------------------------------------------- #
 
@@ -256,14 +317,18 @@ class StreamDownloader:
         sidecar: Path,
         total: int,
         on_progress: ProgressCallback | None,
+        identity: str | None = None,
     ) -> None:
-        state = _load_state(sidecar, part, total, self._chunk_size)
+        state = _load_state(sidecar, part, total, self._chunk_size, identity)
         chunks = plan_chunks(total, self._chunk_size)
 
         if state is None:
             # 全新下载：预分配成稀疏文件，各分片直接 seek 写入
-            with open(part, "wb") as handle:
-                handle.truncate(total)
+            try:
+                with open(part, "wb") as handle:
+                    handle.truncate(total)
+            except OSError as exc:
+                raise _filesystem_error(exc, "预分配临时文件", part) from exc
             done: set[int] = set()
         else:
             done = state.done
@@ -279,7 +344,7 @@ class StreamDownloader:
             async with semaphore:
                 await self._fetch_chunk(urls, chunk, part, on_progress)
             done.add(chunk.index)
-            _save_state(sidecar, total, self._chunk_size, done)
+            _save_state(sidecar, total, self._chunk_size, done, identity)
 
         try:
             async with asyncio.TaskGroup() as group:
@@ -335,11 +400,37 @@ class StreamDownloader:
                 # 走到这里说明探测阶段报告支持 Range，实际却不支持——宁可报错也不能写坏文件
                 raise NetworkError(f"分片请求未返回 206（HTTP {response.status_code}）")
 
+            # Range 请求回错区间时，响应体看着一切正常、内容却是别处的数据，
+            # 只靠长度校验发现不了。所以核对区间本身。
+            bounds = _range_bounds(response.headers.get("content-range"))
+            if bounds is not None and bounds != (chunk.start, chunk.end):
+                raise NetworkError(
+                    f"分片 {chunk.index} 返回的区间不对：请求 {chunk.start}-{chunk.end}，"
+                    f"实际 {bounds[0]}-{bounds[1]}"
+                )
+
             written = 0
-            with open(part, "r+b") as handle:
+            try:
+                handle = open(part, "r+b")
+            except OSError as exc:
+                raise _filesystem_error(exc, "写入临时文件", part) from exc
+
+            with handle:
                 handle.seek(chunk.start)
                 async for block in response.aiter_bytes(_READ_BLOCK):
-                    handle.write(block)
+                    # 超出请求范围的字节会顺着文件偏移写进**相邻分片**的地盘，而相邻
+                    # 分片可能早已完成、不会重下——那就是一个静默损坏却报告成功的文件。
+                    # 在这里就截住：宁可让这个分片重试，也不多写一个字节。
+                    remaining = chunk.length - written
+                    if len(block) > remaining:
+                        raise NetworkError(
+                            f"分片 {chunk.index} 返回的数据超出请求范围："
+                            f"期望 {chunk.length} 字节，实际至少 {written + len(block)} 字节"
+                        )
+                    try:
+                        handle.write(block)
+                    except OSError as exc:
+                        raise _filesystem_error(exc, "写入", part) from exc
                     written += len(block)
                     if on_progress:
                         on_progress(len(block))
@@ -363,8 +454,38 @@ def _total_from_content_range(header: str | None) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
-def _load_state(sidecar: Path, part: Path, total: int, chunk_size: int) -> _ResumeState | None:
-    """读取断点元数据；只要有任何不一致就当作全新下载，绝不冒险复用半个文件。"""
+def _range_bounds(header: str | None) -> tuple[int, int] | None:
+    """``bytes 0-1023/4096`` → ``(0, 1023)``。解析不出来就返回 None。"""
+    if not header or not header.startswith("bytes "):
+        return None
+    spec = header[len("bytes ") :].split("/", 1)[0].strip()
+    start, sep, end = spec.partition("-")
+    if not sep or not start.strip().isdigit() or not end.strip().isdigit():
+        return None
+    return int(start), int(end)
+
+
+def _filesystem_error(exc: OSError, action: str, path: Path) -> FileSystemError:
+    """把 ``OSError`` 翻译成退出码 7，并附上人能读懂的下一步。"""
+    reason = exc.strerror or str(exc)
+    return FileSystemError(
+        f"{action} {path} 失败：{reason}",
+        hint="检查磁盘剩余空间与目录读写权限",
+    )
+
+
+def _load_state(
+    sidecar: Path,
+    part: Path,
+    total: int,
+    chunk_size: int,
+    identity: str | None = None,
+) -> _ResumeState | None:
+    """读取断点元数据；只要有任何不一致就当作全新下载，绝不冒险复用半个文件。
+
+    ``identity`` 是这条流的身份。长度对得上并不代表内容对得上——换成 1080P 重跑时，
+    上一条 480P 留下的 ``.part`` 早已被预分配成完整长度，长度校验会放它过去。
+    """
     if not part.exists() or part.stat().st_size != total:
         return None
     if not sidecar.exists():
@@ -372,6 +493,8 @@ def _load_state(sidecar: Path, part: Path, total: int, chunk_size: int) -> _Resu
     try:
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
         if payload.get("total") != total or payload.get("chunk_size") != chunk_size:
+            return None
+        if payload.get("identity") != identity:
             return None
         done = {int(index) for index in payload.get("done", [])}
     except (OSError, ValueError, TypeError):
@@ -381,8 +504,19 @@ def _load_state(sidecar: Path, part: Path, total: int, chunk_size: int) -> _Resu
     return _ResumeState(total=total, chunk_size=chunk_size, done=done & valid)
 
 
-def _save_state(sidecar: Path, total: int, chunk_size: int, done: set[int]) -> None:
-    payload = {"total": total, "chunk_size": chunk_size, "done": sorted(done)}
+def _save_state(
+    sidecar: Path,
+    total: int,
+    chunk_size: int,
+    done: set[int],
+    identity: str | None = None,
+) -> None:
+    payload = {
+        "total": total,
+        "chunk_size": chunk_size,
+        "identity": identity,
+        "done": sorted(done),
+    }
     temp = sidecar.with_name(sidecar.name + ".tmp")
     try:
         temp.write_text(json.dumps(payload), encoding="utf-8")

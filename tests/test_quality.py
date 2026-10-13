@@ -493,3 +493,100 @@ def test_sort_for_menu_tolerates_unknown_codec() -> None:
     """接口将来新增编码时不该把菜单排序搞崩，排到最后即可。"""
     streams = [vs(32, 480, codec="vp9", codecid=99), vs(16, 360)]
     assert sort_for_menu(streams, PREF)[0].height == 480
+
+
+# --------------------------------------------------------------------------- #
+# 竖屏视频：height 报的是长边，不能拿像素高度当档位高度
+# --------------------------------------------------------------------------- #
+
+
+def vvs(
+    qn: int,
+    long_side: int,
+    *,
+    short_side: int | None = None,
+    codec: str = "avc",
+    codecid: int = AVC,
+    fps: float = 30.0,
+    bandwidth: int = 1_000_000,
+) -> VideoStream:
+    """竖屏视频的一条流。
+
+    B站对竖屏视频把 ``height`` 报成**长边**：1080P 竖屏是 1080x1440，而不是 1080
+    高。``vs()`` 假设 16:9 横屏，表达不了这件事。
+    """
+    short = short_side if short_side is not None else round(long_side * 3 / 4)
+    return VideoStream(
+        qn=qn,
+        codecid=codecid,
+        codec=codec,
+        width=short,
+        height=long_side,
+        fps=fps,
+        bandwidth=bandwidth,
+        urls=(f"https://cdn.example/{qn}-{codec}.m4s",),
+    )
+
+
+def test_vertical_video_is_not_discarded_by_its_long_side() -> None:
+    """竖屏 1080P 报 1080x1440，用像素高度比标称高度会把 1080P 流自己筛掉。
+
+    修复前：登录用户请求 1080P，因为 1440 <= 1080 不成立，1080P 流被排除在候选之外，
+    实际只下到 720P。竖屏内容在B站占比很大，这条路径让"登录解锁 1080P"完全失效。
+    """
+    streams = [vvs(80, 1440, bandwidth=2_456_000), vvs(64, 960), vvs(32, 640), vvs(16, 480)]
+    selection = select_video(
+        streams,
+        parse_quality("1080"),
+        granted_qn=116,
+        accept_quality=[112, 80, 64, 32, 16],
+        logged_in=True,
+    )
+    assert selection.stream.qn == 80
+    assert selection.degraded is False
+
+
+def test_vertical_video_still_honours_the_requested_ceiling() -> None:
+    """长边更高不等于档位更高：`-q 720` 不能因为 1080P 流报 1440 就把它放行。"""
+    streams = [vvs(80, 1440), vvs(64, 960), vvs(32, 640)]
+    selection = select_video(
+        streams,
+        parse_quality("720"),
+        granted_qn=74,
+        accept_quality=[80, 64, 32],
+        logged_in=True,
+    )
+    assert selection.stream.qn == 64
+    assert selection.degraded is False
+
+
+def test_vertical_video_degradation_is_judged_by_tier_not_pixels() -> None:
+    """9:16 的 480P 报 480x854；拿 854 去比 720 会得出降级没发生，把降级漏报掉。"""
+    streams = [vvs(32, 854, short_side=480), vvs(16, 640, short_side=360)]
+    selection = select_video(
+        streams,
+        parse_quality("720"),
+        granted_qn=74,
+        accept_quality=[64, 32, 16],
+        logged_in=True,
+    )
+    assert selection.stream.qn == 32
+    assert selection.degraded is True
+    assert "720P" in (selection.notice or "")
+
+
+def test_streams_above_the_requested_tier_are_excluded() -> None:
+    """接口返回账号权限内的**整条阶梯**，不按我们请求的 qn 截断。
+
+    实测：请求 qn=64 时返回的 dash.video 里同样有 qn=80 的流。少了这层截断，
+    `-q 720` 会悄悄下成 1080P。
+    """
+    streams = [vs(80, 1080), vs(64, 720), vs(32, 480)]
+    selection = select_video(
+        streams,
+        parse_quality("720"),
+        granted_qn=74,
+        accept_quality=[80, 64, 32],
+        logged_in=True,
+    )
+    assert selection.stream.qn == 64

@@ -1,27 +1,34 @@
 """登录态（Cookie）加载与脱敏（FR-09）。
 
 优先级：``--cookie`` > ``--cookie-file`` > 环境变量 > 默认路径 ``~/.bilidl/cookies.txt``。
-文件格式同时容忍 Netscape cookies.txt 与「直接粘贴的一行 Cookie 头」两种写法——
-前者是浏览器插件的导出格式，后者是用户从开发者工具里复制出来的。
+文件格式同时容忍三种写法——标准 Netscape cookies.txt（域名在前）、浏览器插件常见的
+「名字在前」变体、以及直接粘贴的一行 Cookie 头。
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 
 from .errors import UsageError
 
+log = logging.getLogger("bilidl.cookies")
+
 #: 判断「是否已登录」的关键字段。
 SESSDATA_KEY = "SESSDATA"
 
-_ENV_NAMES = ("BILIDL_COOKIE", "BILI_COOKIE")
+_ENV_NAMES = ("BILIDL_COOKIE", "BILI_COOKIE", "BILI_SESSDATA")
 DEFAULT_COOKIE_PATH = Path.home() / ".bilidl" / "cookies.txt"
+
+#: 形如 ``.bilibili.com``。用来判断这一行到底是「域名在前」还是「名字在前」。
+_DOMAIN_RE = re.compile(r"\.?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\Z")
 
 #: 脱敏用：出现在日志/异常里的敏感字段都会被替换成 ***。
 _REDACT_PATTERN = re.compile(
-    r"\b(SESSDATA|bili_jct|DedeUserID|DedeUserID__ckMd5|buvid3|access_key|SESSDATA__ckMd5)"
+    r"\b(SESSDATA|bili_jct|DedeUserID|DedeUserID__ckMd5|buvid3|buvid4|buvid_fp|"
+    r"bili_ticket|bili_ticket_expires|access_key|SESSDATA__ckMd5|b_nut|_uuid|sid)"
     r"\s*[=:]\s*([^;,\s&\"']+)",
     re.IGNORECASE,
 )
@@ -47,8 +54,48 @@ def parse_cookie_string(raw: str) -> dict[str, str]:
     return cookies
 
 
+def _looks_like_domain(value: str) -> bool:
+    return bool(_DOMAIN_RE.match(value.strip()))
+
+
+def _clean_value(name: str, value: str) -> str:
+    """剔除 HTTP 头承载不了的字符。
+
+    浏览器插件导出的 Cookie 文件里偶尔会混进 ``✓`` 之类的标记字符（导出时把布尔列
+    渲染成了勾）。这类字符会让 httpx 在发请求那一刻抛 ``UnicodeEncodeError``，
+    而用户完全无法把那个报错和「文件里有个勾」联系起来。
+    """
+    value = value.strip().strip('"')
+    cleaned = "".join(ch for ch in value if 0x20 < ord(ch) < 0x7F)
+    if cleaned != value:
+        log.warning("Cookie %s 的值里有 HTTP 头装不下的字符，已剔除", name)
+    return cleaned
+
+
+def _name_and_value(fields: list[str]) -> tuple[str, str]:
+    """从一行制表符分隔的记录里取出 ``(名字, 值)``，两种列序都认。
+
+    标准 Netscape 是「域名 标志 路径 安全 过期 名字 值」，但浏览器插件导出的
+    往往是「名字 值 域名 路径 过期 …」（列数还各不相同）。只认前者的后果不是
+    报错，而是**安静地解析出一堆垃圾字段**——第 6、7 列在那种文件里是导出工具
+    自己的标记列。所以这里靠"哪一列长得像域名、哪一列长得像路径"来定列序。
+    """
+    if len(fields) < 5:
+        return "", ""
+
+    # 名字在前：第 3 列是域名、第 4 列是路径
+    if _looks_like_domain(fields[2]) and fields[3].strip().startswith("/"):
+        return fields[0].strip(), fields[1].strip()
+
+    # 标准 Netscape，域名在前：第 1 列是域名、第 3 列是路径
+    if len(fields) >= 7 and _looks_like_domain(fields[0]) and fields[2].strip().startswith("/"):
+        return fields[5].strip(), fields[6].strip()
+
+    return "", ""
+
+
 def load_from_file(path: Path) -> dict[str, str]:
-    """读取 Cookie 文件，自动识别 Netscape 格式与单行 Cookie 头格式。"""
+    """读取 Cookie 文件，自动识别 Netscape 格式（两种列序）与单行 Cookie 头格式。"""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
@@ -77,9 +124,11 @@ def load_from_file(path: Path) -> dict[str, str]:
             line = line[len("#HttpOnly_") :]
         elif line.startswith("#"):
             continue
-        fields = line.split("\t")
-        if len(fields) >= 7:  # domain, flag, path, secure, expiry, name, value
-            cookies[fields[5]] = fields[6]
+        if "\t" not in line:
+            continue
+        name, value = _name_and_value(line.split("\t"))
+        if name:
+            cookies[name] = _clean_value(name, value)
 
     if cookies:
         return cookies
