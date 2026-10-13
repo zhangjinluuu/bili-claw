@@ -125,22 +125,34 @@ bilidl 不会代替你登录，你需要自己提供 Cookie：
 
 1. 浏览器登录 B站
 2. 打开开发者工具 → Application → Cookies → `https://www.bilibili.com`
-3. 导出为 Netscape 格式，或直接复制整条 Cookie 字符串
+3. 复制整条 Cookie 字符串（至少要含 `SESSDATA`），或导出为 Netscape 格式
 
 ```bash
-# 方式一：Cookie 文件（推荐，不会被 shell 历史记录）
+# 方式一：放到默认路径，之后所有命令自动带上，不用加参数（推荐）
+mkdir -p ~/.bilidl && chmod 700 ~/.bilidl
+printf '%s' 'SESSDATA=粘贴到这里; bili_jct=...' > ~/.bilidl/cookies.txt
+chmod 600 ~/.bilidl/cookies.txt
+
+# 方式二：临时指定某个文件
 bilidl <URL> --cookie-file ~/bili-cookies.txt
 
-# 方式二：直接传字符串
+# 方式三：直接传字符串
 bilidl <URL> --cookie "SESSDATA=xxx; bili_jct=yyy"
 
-# 方式三：环境变量
+# 方式四：环境变量
 export BILIDL_COOKIE="SESSDATA=xxx"
 bilidl <URL>
 ```
 
+四种方式按 `--cookie` > `--cookie-file` > 环境变量 > 默认路径 的顺序生效。
+
 > ⚠️ Cookie 等同于账号凭据。bilidl 只把它放进请求头，不写入日志、不写入产物文件；
-> `--debug` 输出里的 Cookie 也会自动脱敏。但仍然请勿把 Cookie 文件提交到版本库。
+> `--debug` 输出里的 Cookie 也会自动脱敏。但仍然请勿把 Cookie 文件提交到版本库，
+> 并保持 `chmod 600`（仅本人可读）。
+
+放好之后用 `bilidl --check` 确认登录态**真的**生效了——它会显示账号名与大会员状态，
+并告诉你这个账号最高能下到多高；如果 Cookie 已过期，会直接说「多半是 SESSDATA 过期了」
+并给出退出码 4，而不是含糊地报个网络错误。
 
 ## 常用参数
 

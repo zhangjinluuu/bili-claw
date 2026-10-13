@@ -172,3 +172,10 @@ class NavData(_Model):
     mid: int = 0
     uname: str = ""
     wbi_img: WbiImg | None = None
+    # vipStatus=1 表示大会员有效；vipType 区分月度/年度，界面展示用不上。
+    # 未登录时接口不给这两个字段，所以要有默认值。
+    vipStatus: int = 0
+    vipType: int = 0
+
+    def is_vip(self) -> bool:
+        return self.vipStatus == 1

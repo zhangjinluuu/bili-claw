@@ -551,19 +551,24 @@ async def _refresh_audio(
 
 
 async def run_check(options: Options, console: Console) -> int:
-    """``--check``：确认依赖与登录态，便于安装后第一时间发现问题（对应 E2E-9）。"""
-    ok = True
+    """``--check``：确认依赖与登录态，便于安装后第一时间发现问题（对应 E2E-9）。
+
+    返回最具体的那一个退出码（FR-11），而不是笼统的失败码——脚本据此就能判断
+    是该装 ffmpeg、该查网络，还是该重新登录。
+    """
+    code = ExitCode.OK
 
     ffmpeg = find_ffmpeg()
     if ffmpeg:
         console.print(f"[green]✓[/green] ffmpeg：{ffmpeg}")
     else:
-        ok = False
+        code = ExitCode.MISSING_DEPENDENCY
         console.print("[red]✗[/red] 未找到 ffmpeg——音视频合并无法进行（退出码 6）")
         console.print("  [dim]→ macOS: brew install ffmpeg[/dim]")
 
     cookies, source = resolve_cookie(explicit=options.cookie, cookie_file=options.cookie_file)
-    if is_logged_in(cookies):
+    has_cookie = is_logged_in(cookies)
+    if has_cookie:
         console.print(f"[green]✓[/green] 登录态：已加载（来源：{source}）")
     else:
         console.print("[yellow]·[/yellow] 登录态：未登录，最高只能下载 480P（720P 及以上需要登录）")
@@ -571,14 +576,31 @@ async def run_check(options: Options, console: Console) -> int:
     async with BiliClient(cookies=cookies, retries=options.retries) as client:
         nav = await client.probe_login()
         if nav is None:
-            ok = False
+            code = ExitCode.NETWORK
             console.print("[red]✗[/red] 无法访问 B站接口（网络不通或接口已变更）")
         elif nav.isLogin:
-            console.print(f"[green]✓[/green] B站账号：{nav.uname}（UID {nav.mid}）")
+            # 用户真正想知道的是"登录之后我能下到多高"，而不是"cookie 读到了没有"，
+            # 所以顺带把大会员状态翻出来——它决定了 4K/HDR 这一档到底开不开。
+            tier = "大会员" if nav.is_vip() else "非大会员"
+            console.print(f"[green]✓[/green] B站账号：{nav.uname}（UID {nav.mid}，{tier}）")
+            ceiling = (
+                "4K / 8K / HDR / 杜比（仍取决于片源是否提供）"
+                if nav.is_vip()
+                else "1080P / 1080P60（4K / 8K / HDR 需要大会员）"
+            )
+            console.print(f"  [dim]→ 该账号最高可下载：{ceiling}[/dim]")
+        elif has_cookie:
+            # 本地读到了 Cookie、B站却不认账：这不是"没登录"，而是登录态已经失效。
+            # 含糊地说"接口可达"会让人去查网络，方向就错了。
+            code = ExitCode.AUTH
+            console.print(
+                "[red]✗[/red] Cookie 已读到，但 B站不认为这是登录态——多半是 SESSDATA 过期了"
+            )
+            console.print("  [dim]→ 重新登录 B站并复制一份新的 Cookie（退出码 4）[/dim]")
         else:
-            console.print("[yellow]·[/yellow] B站接口可达；当前 Cookie 不是登录态")
+            console.print("[yellow]·[/yellow] B站接口可达；未提供登录态（匿名最高 480P）")
 
-    return ExitCode.OK if ok else ExitCode.MISSING_DEPENDENCY
+    return int(code)
 
 
 # --------------------------------------------------------------------------- #
