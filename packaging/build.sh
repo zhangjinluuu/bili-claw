@@ -2,7 +2,7 @@
 #
 # 构建 BiliClaw 的单文件产物并打成发布归档。
 #
-#   packaging/build.sh          # 构建 + 冒烟 + 归档
+#   packaging/build.sh                # 构建 + 冒烟 + 归档
 #   packaging/build.sh --no-archive   # 只构建，不归档（本地调试用）
 #
 # 这个开关**刻意不叫 --check**：`bclaw --check` 是检查运行环境，两回事，同名会让人
@@ -47,6 +47,29 @@ fi
 
 TAG="${OS}-${ARCH}"
 
+# --- 进度标记与失败上报 -----------------------------------------------------
+# CI 的原始日志**要登录才能下载**，而 GitHub 的 annotation 是匿名可读的。所以这里
+# 每进入一个阶段就发一条 ::notice::，失败时发 ::error::——"最后一条 notice 是哪一步"
+# 本身就告诉了你死在哪，既不用读日志，也不用猜。
+#
+# 这些标记刻意全是 ASCII：Windows 控制台的默认代码页不是 UTF-8，中文标记会和冒烟
+# 测试那件事一样把人带偏（见下面的注释）。
+#
+# 本地跑时 CI 未设置，两个函数都不输出任何东西——终端里保持干净。
+step() {
+    [ -n "${CI:-}" ] || return 0
+    printf '::notice::bclaw-build[%s] %s\n' "$TAG" "$1"
+}
+
+# 用法：<命令> || fail "能在 annotation 里定位到问题的描述"
+fail() {
+    printf '✗ %s\n' "$1" >&2
+    [ -n "${CI:-}" ] && printf '::error::bclaw-build[%s] %s\n' "$TAG" "$1"
+    exit 1
+}
+
+step "platform detected: uname -s='$(uname -s)' uname -m='$(uname -m)' → $TAG"
+
 # --- 解释器与虚拟环境 -------------------------------------------------------
 # 产物落在 .venv 之外的 dist/，但构建必须在有 pyinstaller 的环境里跑。
 if [ "$OS" = windows ]; then
@@ -60,36 +83,45 @@ fi
 if [ ! -x "$VENV_PY" ]; then
     echo "▸ 创建 .venv"
     if command -v uv >/dev/null 2>&1; then
-        uv venv --python 3.12
+        uv venv --python 3.12 || fail "uv venv --python 3.12 失败（interpreter=${VENV_PY}）"
     else
-        python3 -m venv .venv
+        python3 -m venv .venv || fail "python3 -m venv .venv 失败（没有 uv，也没有可用的 python3）"
     fi
 fi
 
+if [ ! -x "$VENV_PY" ]; then
+    fail "虚拟环境建好了却找不到解释器：${VENV_PY} 不存在或不可执行"
+fi
+step "venv ready: ${VENV_PY}（$( "$VENV_PY" -c 'import sys; print(sys.version.split()[0], sys.platform)' )）"
+
 echo "▸ 安装构建依赖"
+step "installing build deps (uv=$([ "$(command -v uv || true)" != "" ] && echo yes || echo no))"
 if command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$VENV_PY" -e . pyinstaller
+    uv pip install --python "$VENV_PY" -e . pyinstaller || fail "uv pip install -e . pyinstaller 失败"
 else
-    "$VENV_PY" -m pip install --quiet -e . pyinstaller
+    "$VENV_PY" -m pip install --quiet -e . pyinstaller || fail "pip install -e . pyinstaller 失败"
 fi
 
-VERSION="$("$VENV_PY" -c 'import biliclaw; print(biliclaw.__version__)')"
+VERSION="$("$VENV_PY" -c 'import biliclaw; print(biliclaw.__version__)')" \
+    || fail "装完之后 import biliclaw 仍然失败——editable 安装没接上 src/ 布局"
 echo "▸ BiliClaw $VERSION → $TAG"
+step "biliclaw $VERSION 可导入，开始 PyInstaller"
 
 # --- 构建 -------------------------------------------------------------------
 # --clean 是必须的：spec 里改了 EXCLUDES 却复用上一次的缓存时，被排掉的包会
 # 悄悄留在产物里，体积变化就成了唯一线索。
-"$VENV_PY" -m PyInstaller --clean --noconfirm packaging/bclaw.spec
+"$VENV_PY" -m PyInstaller --clean --noconfirm packaging/bclaw.spec \
+    || fail "PyInstaller 构建失败（日志尾部见 annotation）"
 
 if [ ! -f "$BIN" ]; then
-    echo "✗ 构建失败：找不到 $BIN" >&2
-    exit 1
+    fail "PyInstaller 报成功，但产物 ${BIN} 不在——先看 spec 里的 name 与 dist 路径"
 fi
 
 SIZE="$(wc -c <"$BIN" | tr -d ' ')"
 # 花括号不能省：紧跟其后的是全角括号，不加大括号时 bash 会把那几个字节
 # 当成变量名的一部分，`set -u` 于是报 "unbound variable"。
 echo "▸ 产物：${BIN}（$((SIZE / 1024 / 1024)) MB）"
+step "artifact built: ${BIN} ${SIZE} bytes"
 
 # --- 冒烟测试 ---------------------------------------------------------------
 # --version 证明能启动；--selftest 会真的用内置样本合并一次，是打包后唯一能在
@@ -100,17 +132,17 @@ echo "▸ 产物：${BIN}（$((SIZE / 1024 / 1024)) MB）"
 # 上真的因此整个 job 失败过一次，失败点看起来还像"合并内核坏了"。--selftest 走
 # 纯 ASCII 输出、不碰网络、退出码就是结论，三个平台判读方式完全一致。
 echo "▸ 冒烟测试"
-"$BIN" --version >/dev/null
+"$BIN" --version >/dev/null || fail "产物无法启动：${BIN} --version 非零退出"
 
 if ! SELFTEST_OUT="$("$BIN" --selftest 2>&1)"; then
-    echo "✗ 合并内核自检未通过：" >&2
     echo "$SELFTEST_OUT" >&2
-    exit 1
+    fail "合并内核自检未通过：$(printf '%s' "$SELFTEST_OUT" | tr -d '\r' | head -n 3 | tr '\n' ' ')"
 fi
 # 变量放句尾：`$VAR` 后面紧跟全角括号时，bash 会把那几个字节当成变量名的一部分。
 # 这个坑已经踩过两次（上次是 `$BIN（`），所以 tests/test_packaging.py 里有一条
 # 扫描 packaging/*.sh 的用例专门守它——别再靠人记得。
 echo "  ✓ 启动正常，合并内核自检通过 —— $SELFTEST_OUT"
+step "smoke test passed: $SELFTEST_OUT"
 
 [ "$ARCHIVE" -eq 0 ] && exit 0
 
@@ -127,12 +159,15 @@ if [ "$OS" = windows ]; then
 import zipfile
 with zipfile.ZipFile(r'release/${NAME}.zip', 'w', zipfile.ZIP_DEFLATED) as z:
     z.write(r'dist/bclaw.exe', 'bclaw.exe')
-"
+" || fail "打包 zip 失败（${NAME}.zip）"
+    ARCHIVE_PATH="release/${NAME}.zip"
 else
     # 归档里只放二进制本身：解压出来就该是可直接执行的单文件，
     # 而不是「先读 README 再决定放哪」。
-    tar czf "release/${NAME}.tar.gz" -C dist bclaw
+    tar czf "release/${NAME}.tar.gz" -C dist bclaw || fail "打包 tar.gz 失败（${NAME}.tar.gz）"
+    ARCHIVE_PATH="release/${NAME}.tar.gz"
 fi
 
-echo "▸ 归档：release/${NAME}.$([ "$OS" = windows ] && echo zip || echo tar.gz)"
+echo "▸ 归档：$ARCHIVE_PATH"
 ls -l release/
+step "archived: ${ARCHIVE_PATH} $(wc -c <"$ARCHIVE_PATH" | tr -d ' ') bytes"
