@@ -11,7 +11,6 @@ $ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
   🎰 抓到了：住手 你们不要再摇花手了.mp4　downloads/神威-狗剩 · 8.5 MB
 ```
 
-> **先说实话**：如果你只是想下载 B站视频，[yt-dlp](https://github.com/yt-dlp/yt-dlp) 已经做得非常完整了。
 > 这个项目的价值在于把「清晰度选择」这件事做对——B站会静默降级你的请求，绝大多数工具只告诉你
 > 它下到了什么，而不告诉你**为什么没拿到你要的那一档**。BiliClaw 的原则是：绝不静默降级。
 
@@ -37,7 +36,7 @@ $ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
 brew install ffmpeg
 
 # 安装 bili-claw
-cd bilibili_downloader
+cd bili-claw
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
 source .venv/bin/activate
