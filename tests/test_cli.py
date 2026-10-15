@@ -307,3 +307,66 @@ async def test_login_probe_failure_does_not_claim_the_cookie_expired() -> None:
 
 async def test_valid_cookie_passes_the_gate() -> None:
     await cli._reject_expired_cookie(_ProbeOnlyClient(NavData(isLogin=True, uname="某人")), "--cookie")
+
+
+# --------------------------------------------------------------------------- #
+# 输出编码：Windows 上冻结产物会崩在这里
+# --------------------------------------------------------------------------- #
+
+
+class _FakeStream:
+    """只记下 `reconfigure` 收到了什么。"""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.calls: list[dict[str, str]] = []
+        self._explode = explode
+
+    def reconfigure(self, **kwargs: str) -> None:
+        if self._explode:
+            raise OSError("流已经关掉了")
+        self.calls.append(kwargs)
+
+
+def test_force_utf8_output_pins_both_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdout 与 stderr 都要钉成 UTF-8，并带上 `errors="replace"` 兜底。
+
+    真正的故障现场（Windows 单文件产物）：
+
+        > bclaw.exe --version
+        UnicodeEncodeError: 'charmap' codec can't encode characters in position 15-20
+        [PYI-7568:ERROR] Failed to execute script 'entry' due to unhandled exception!
+
+    `--version` 打的是 `bili-claw 0.1.0（哔哩娃娃机 / BiliClaw）`——全角括号与中文在
+    cp1252 里没有对应字符。stderr 同样要管：诊断信息全是中文，崩在 stderr 上就再没有
+    地方可以打印原因了。
+
+    用 `monkeypatch.context()` 而不是裸 `setattr`：断言失败时 stdout 已经还原，否则
+    pytest 自己都打不出那行失败信息。
+    """
+    out, err = _FakeStream(), _FakeStream()
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "stdout", out)
+        patch.setattr(cli.sys, "stderr", err)
+        cli._force_utf8_output()
+
+    assert out.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert err.calls == [{"encoding": "utf-8", "errors": "replace"}]
+
+
+def test_force_utf8_output_tolerates_streams_without_reconfigure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试替身（`io.StringIO`、CliRunner 用的流）没有 `reconfigure`——不能因此崩掉。"""
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "stdout", io.StringIO())
+        patch.setattr(cli.sys, "stderr", io.StringIO())
+        cli._force_utf8_output()  # 不抛就算过
+
+
+def test_force_utf8_output_swallows_reconfigure_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """设置输出编码失败**永远不该**成为程序起不来的原因。"""
+    out, err = _FakeStream(explode=True), _FakeStream(explode=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "stdout", out)
+        patch.setattr(cli.sys, "stderr", err)
+        cli._force_utf8_output()  # 不抛就算过
+
+    assert out.calls == [] and err.calls == []

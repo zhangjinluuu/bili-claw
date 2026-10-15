@@ -128,16 +128,20 @@ def test_build_smoke_test_uses_selftest_not_check() -> None:
     """冒烟测试必须用 `--selftest`，不能靠 grep `--check` 的中文输出。
 
     早期版本是 `"$BIN" --check | grep -q "自检通过"`。那个写法有两处不好：判读依赖
-    人读的文案（文案一改，CI 就红），而且 Windows 上真的整个 job 失败过一次。
+    人读的文案（文案一改，CI 就红），而且 Windows 上真的整个 job 失败过一次，失败
+    信息却指向合并内核——内核根本没问题。
 
-    当时把原因归结为"Windows 控制台代码页不是 UTF-8，grep 匹配不上中文"，事后证明
-    **那个诊断也是错的**——PyInstaller 冻结后 `sys.stdout.encoding` 恒为 `utf-8`，
-    中文照样输出（Windows 那次失败的真正位置在 PyInstaller 的 EXE 阶段，与编码无关，
-    见 `test_shell_scripts_are_pinned_to_lf` 里记的那次对照实验）。
+    > **这里记一次绕远路的更正。** 起初把原因判为"Windows 控制台代码页不是 UTF-8，
+    > grep 匹配不上中文"，随后又**推翻了自己**，理由是"PyInstaller 冻结后
+    > `sys.stdout.encoding` 恒为 utf-8"。**第二次判断才是错的**：冻结产物在 stdout
+    > 被重定向（CI 就是管道）时，用的是 `locale.getpreferredencoding()`，Windows 上
+    > 正是 cp1252，`bclaw.exe --version` 会直接 `UnicodeEncodeError` 崩掉，报
+    > `[PYI-7568:ERROR] Failed to execute script 'entry'`。最初的诊断是对的。
+    > 真正的修法是 `cli._force_utf8_output()`，不是绕开中文。
 
-    但 `--selftest` 依然该留着，理由换成了更站得住的那个：它是**给脚本判读的信号**，
-    不是给人读的文案——纯 ASCII、不碰网络、退出码就是结论，三个平台的判读方式完全
-    一致。文案怎么改都不会影响 CI。
+    编码修好之后 `--selftest` 依然该留着，理由换成了更站得住的那个：它是**给脚本
+    判读的信号**，不是给人读的文案——纯 ASCII、不碰网络、退出码就是结论，三个平台
+    判读方式完全一致，不依赖任何一句可能被改写的文案。
     """
     text = _strip_comments((PACKAGING / "build.sh").read_text(encoding="utf-8"))
     assert "--selftest" in text
@@ -325,3 +329,25 @@ def test_printf_format_strings_never_swallow_their_argument() -> None:
             )
 
     assert checked >= 5, f"只检查到 {checked} 个带参数的 printf 格式串——正则可能失效了"
+
+
+def test_build_smoke_test_forces_a_non_utf8_encoding() -> None:
+    """冒烟测试必须用 `PYTHONIOENCODING=cp1252` 逼一次**输出编码**路径。
+
+    Windows 上 stdout 被重定向（CI 就是管道）时，Python 用的是
+    `locale.getpreferredencoding()`，那台 runner 上正是 cp1252；而 `--version` 要打
+    「（哔哩娃娃机 / BiliClaw）」、`--check` 要打 `✓`，两者在 cp1252 里都编不出来。
+    真实故障是**崩溃**而不是乱码：
+
+        UnicodeEncodeError: 'charmap' codec can't encode characters in position 15-20
+        [PYI-7568:ERROR] Failed to execute script 'entry' due to unhandled exception!
+
+    这条守卫的价值在于**跨平台**：`PYTHONIOENCODING` 的覆盖在 macOS/Linux 上同样生效，
+    于是"只有 Windows 才暴露"的故障在本地就能撞见。配套的修法是
+    `cli._force_utf8_output()`——把它换成空函数，`build.sh` 立刻红在这一行。
+    """
+    text = _strip_comments((PACKAGING / "build.sh").read_text(encoding="utf-8"))
+    assert "PYTHONIOENCODING=cp1252" in text, "冒烟测试要在非 UTF-8 编码下也跑一次 --version"
+    # 只检查退出码不够：stdout 与 stderr 合并捕获了，一个什么都不打就退出的产物也会
+    # "通过"——而"什么都不打"正是编码出问题时的典型症状。
+    assert 'grep -q "bili-claw"' in text, "还要确认 cp1252 下真的打出了内容"

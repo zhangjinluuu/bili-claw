@@ -165,12 +165,33 @@ step "artifact built: ${BIN} ${SIZE} bytes"
 # --version 证明能启动；--selftest 会真的用内置样本合并一次，是打包后唯一能在
 # **构建机上**发现「这个构建的合并坏了」的地方。
 #
-# 这里刻意用 --selftest 而不是 --check：--check 的输出里有中文（"自检通过"），
-# 而 Windows 控制台的默认代码页不是 UTF-8，`grep` 那些字永远不匹配——Windows CI
-# 上真的因此整个 job 失败过一次，失败点看起来还像"合并内核坏了"。--selftest 走
-# 纯 ASCII 输出、不碰网络、退出码就是结论，三个平台判读方式完全一致。
+# 这里刻意用 --selftest 而不是 --check：脚本要靠**给机器判读的信号**做结论，而不是
+# 靠人读的文案——文案一改 CI 就红。ASCII、不碰网络、退出码即结论，三个平台一致。
 echo "▸ 冒烟测试"
 "$BIN" --version >/dev/null || fail "产物无法启动：${BIN} --version 非零退出"
+
+# 再用 cp1252 逼一次**输出编码**路径。
+#
+# 这不是随便挑的编码：Windows 上 stdout 被重定向（CI 就是管道）时，Python 用
+# `locale.getpreferredencoding()`，那台 runner 上正是 cp1252，而 `--version` 要打
+# 「（哔哩娃娃机 / BiliClaw）」——全角括号与中文在 cp1252 里都没有对应字符。真实故障：
+#
+#     UnicodeEncodeError: 'charmap' codec can't encode characters in position 15-20
+#     [PYI-7568:ERROR] Failed to execute script 'entry' due to unhandled exception!
+#
+# 注意是**崩溃**而不是输出乱码——用户看到的是"程序打不开"。
+#
+# 值得写在这里的是：PYTHONIOENCODING 覆盖在所有平台上都生效，所以这一行让一个
+# 「只有 Windows 才暴露」的故障在 macOS/Linux 上**本地就能撞见**——当初为了复现它
+# 读了好几轮 CI 日志。`cli._force_utf8_output()` 是配套的修法，去掉它这一行立刻红。
+if ! CP1252_OUT="$(PYTHONIOENCODING=cp1252 "$BIN" --version 2>&1)"; then
+    fail "产物在 cp1252 输出下无法启动（Windows 重定向时就是这个编码）：$(printf '%s' "$CP1252_OUT" | tr -d '\r' | head -n 2 | tr '\n' ' ')"
+fi
+# 退出码为 0 还不够：stdout 与 stderr 合并捕获了，一个什么都不打就退出的产物也会
+# "通过"——而"什么都不打"正是编码出问题时的典型症状。要求它真打出程序名。
+if ! printf '%s' "$CP1252_OUT" | grep -q "bili-claw"; then
+    fail "cp1252 下的 --version 没打出内容：$(printf '%s' "$CP1252_OUT" | tr -d '\r' | head -n 2 | tr '\n' ' ')"
+fi
 
 if ! SELFTEST_OUT="$("$BIN" --selftest 2>&1)"; then
     echo "$SELFTEST_OUT" >&2

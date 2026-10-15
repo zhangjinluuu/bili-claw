@@ -1006,10 +1006,15 @@ def cli(
         raise typer.Exit()
 
     if selftest:
-        # **输出刻意全是 ASCII。** 这条路径是给构建脚本判读的，而 Windows 控制台的
-        # 默认代码页不是 UTF-8：中文提示在那边会变成乱码，于是脚本里的
-        # `grep "自检通过"` 永远不匹配，构建就"失败"在一个根本没有坏的地方
-        # ——Windows CI 上真踩过一次，排查成本远高于写这四行。
+        # **输出刻意全是 ASCII。** 这条路径是给构建脚本判读的，它要的是"结论"而不是
+        # "文案"：纯 ASCII、不碰网络、退出码即结论，三个平台的判读方式完全一致。
+        #
+        # 早期版本靠 `grep "自检通过"` 去读 `--check` 的中文输出，Windows CI 上整个
+        # job 挂在那里，而失败信息指向合并内核——内核根本没问题。根因是 Windows 的
+        # cp1252 编不出中文（见 `_force_utf8_output`，那条路径后来修掉了）。
+        #
+        # 编码修好之后这条依然保留：它让构建脚本**不依赖任何一句可能被改写的文案**。
+        # 文案怎么改都不会影响 CI。
         failure = check_merge()
         if failure is None:
             typer.echo("merge self-check: OK")
@@ -1069,8 +1074,44 @@ def reproduce_command() -> str:
     return redact(" ".join(["bili-claw", *(shlex.quote(part) for part in sys.argv[1:])]))
 
 
+def _force_utf8_output() -> None:
+    """把 stdout/stderr 钉成 UTF-8。Windows 上这一步是必需的。
+
+    Windows 的控制台**与重定向流**默认使用 ANSI 代码页（CI 那台 runner 上是 cp1252）。
+    冻结成单文件之后没有任何环境变量兜底，于是 ``--version`` 里这句
+
+        typer.echo(f"bili-claw {__version__}（哔哩娃娃机 / BiliClaw）")
+
+    会直接抛：
+
+        UnicodeEncodeError: 'charmap' codec can't encode characters in position 15-20
+        [PYI-7568:ERROR] Failed to execute script 'entry' due to unhandled exception!
+
+    注意是**崩溃**而不是输出乱码——管道/重定向时 Python 用
+    ``locale.getpreferredencoding()`` 决定编码，正好是 cp1252。
+
+    钉成 UTF-8 之后两个场景都正确：真控制台上 Python 走 ``WriteConsoleW``，这个编码
+    只用于内存里的转换，显示照旧；重定向时输出 UTF-8 字节，这也是现代工具的通行做法。
+
+    ``errors="replace"`` 是兜底：任何编不出来的字符退化成 ``?``，而不是让整条命令崩掉。
+    整段又套了一层 try——测试替身（比如 CliRunner 用的流）不一定有 ``reconfigure``，
+    而"设置输出编码"这件事永远不该成为程序起不来的原因。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
 def main() -> None:
     """控制台脚本入口：把领域异常翻译成用户提示与退出码（FR-11 / FR-12）。"""
+    # 必须赶在任何输出之前——`--version` 与 `--help` 是 typer 的 eager 回调，
+    # 会在下面 app() 里解析参数时就打印。
+    _force_utf8_output()
     try:
         app()
     except BiliError as exc:
