@@ -13,10 +13,10 @@ from typing import Any, Self
 import pytest
 from rich.console import Console
 
-from bilidl import cli
-from bilidl.cli import Options
-from bilidl.errors import ExitCode
-from bilidl.models import NavData
+from biliclaw import cli
+from biliclaw.cli import Options
+from biliclaw.errors import ExitCode
+from biliclaw.models import NavData
 
 
 class _FakeClient:

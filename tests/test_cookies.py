@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bilidl.cookies import (
+from biliclaw.cookies import (
     SESSDATA_KEY,
     cookie_header,
     is_logged_in,
@@ -15,7 +15,7 @@ from bilidl.cookies import (
     parse_cookie_string,
     redact,
 )
-from bilidl.errors import UsageError
+from biliclaw.errors import UsageError
 
 NETSCAPE = """# Netscape HTTP Cookie File
 .bilibili.com\tTRUE\t/\tFALSE\t1893456000\tSESSDATA\tabc%2Cdef
@@ -174,7 +174,7 @@ def test_world_readable_cookie_file_is_flagged(tmp_path: Path, caplog: pytest.Lo
     path.write_text("SESSDATA=abc", encoding="utf-8")
     path.chmod(0o644)
 
-    with caplog.at_level(logging.WARNING, logger="bilidl.cookies"):
+    with caplog.at_level(logging.WARNING, logger="biliclaw.cookies"):
         assert load_from_file(path) == {"SESSDATA": "abc"}
 
     assert "权限过宽" in caplog.text
@@ -186,7 +186,7 @@ def test_private_cookie_file_is_quiet(tmp_path: Path, caplog: pytest.LogCaptureF
     path.write_text("SESSDATA=abc", encoding="utf-8")
     path.chmod(0o600)
 
-    with caplog.at_level(logging.WARNING, logger="bilidl.cookies"):
+    with caplog.at_level(logging.WARNING, logger="biliclaw.cookies"):
         load_from_file(path)
 
     assert caplog.text == ""

@@ -6,7 +6,7 @@ import itertools
 
 import pytest
 
-from bilidl.downloader import Chunk, parse_rate, plan_chunks
+from biliclaw.downloader import Chunk, parse_rate, plan_chunks
 
 
 def test_chunk_length_is_inclusive() -> None:

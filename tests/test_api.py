@@ -12,8 +12,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from bilidl.api import BiliClient
-from bilidl.errors import (
+from biliclaw.api import BiliClient
+from biliclaw.errors import (
     ApiSchemaError,
     AuthError,
     ExitCode,
@@ -82,7 +82,7 @@ async def test_412_backs_off_twice_as_long_as_an_ordinary_failure(
     async def fake_sleep(seconds: float) -> None:
         waits.append(seconds)
 
-    monkeypatch.setattr("bilidl.api.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("biliclaw.api.asyncio.sleep", fake_sleep)
 
     async def risk(request: httpx.Request) -> httpx.Response:
         return httpx.Response(412)

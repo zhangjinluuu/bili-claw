@@ -28,7 +28,7 @@ import httpx
 
 from .errors import BiliError, FileSystemError, LinkExpiredError, NetworkError
 
-log = logging.getLogger("bilidl.downloader")
+log = logging.getLogger("biliclaw.downloader")
 
 #: 单个分片的目标大小。太小会放大请求开销，太大则并发调度不够灵活。
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024

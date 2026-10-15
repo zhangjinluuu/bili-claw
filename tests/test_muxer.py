@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from bilidl import muxer
-from bilidl.errors import BiliError
-from bilidl.muxer import (
+from biliclaw import muxer
+from biliclaw.errors import BiliError
+from biliclaw.muxer import (
     DURATION_TOLERANCE,
     build_merge_command,
     choose_container,

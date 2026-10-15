@@ -1,14 +1,16 @@
-"""命令行入口。
+"""哔哩娃娃机 / BiliClaw —— 命令行入口。
+
+投币，出爪，把喜欢抓回家。
 
 对应需求：FR-01 输入解析、FR-02 信息展示、FR-03 清晰度选择、FR-04 下载、
 FR-05 合并、FR-07 命名、FR-09 登录态、FR-11 进度与退出码、FR-12 错误提示。
 
 用法示例::
 
-    bilidl "https://www.bilibili.com/video/BV1xx411c7mD"
-    bilidl BV1xx411c7mD -q 720
-    bilidl <URL> -q 1080 --cookie-file ~/bili-cookies.txt
-    bilidl <URL> --list-qualities
+    bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
+    bclaw BV1xx411c7mD -q 720
+    bclaw <URL> -q 1080 --cookie-file ~/bili-cookies.txt
+    bclaw <URL> --list-qualities
 """
 
 from __future__ import annotations
@@ -50,7 +52,10 @@ from .progress import ProgressReporter
 
 app = typer.Typer(
     add_completion=False,
-    help="B站视频下载器——支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与 ffmpeg 无损合并。",
+    help=(
+        "哔哩娃娃机 / BiliClaw —— 投币，出爪，把喜欢抓回家。\n\n"
+        "支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与 ffmpeg 无损合并。"
+    ),
 )
 
 err_console = Console(stderr=True)
@@ -320,7 +325,7 @@ async def _playurl(client: BiliClient, bvid: str, cid: int, qn: int) -> PlayUrlD
     try:
         return await client.playurl(bvid=bvid, cid=cid, qn=qn)
     except AuthError:
-        logging.getLogger("bilidl").debug("playurl 返回权限错误，刷新 WBI 后重试")
+        logging.getLogger("biliclaw").debug("playurl 返回权限错误，刷新 WBI 后重试")
         client.invalidate_wbi()
         return await client.playurl(bvid=bvid, cid=cid, qn=qn)
 
@@ -340,7 +345,7 @@ async def _download_stream(
     try:
         return await downloader.download(urls, dest, on_progress=on_progress, on_total=on_total, total_hint=size)
     except LinkExpiredError:
-        logging.getLogger("bilidl").info("%s 的下载链接已过期，正在自动换链", label)
+        logging.getLogger("biliclaw").info("%s 的下载链接已过期，正在自动换链", label)
         fresh_urls, fresh_size = await refresh()
         return await downloader.download(
             fresh_urls, dest, on_progress=on_progress, on_total=on_total, total_hint=fresh_size
@@ -613,7 +618,9 @@ async def process_page(
         audio_temp.unlink(missing_ok=True)
 
     size_mb = output.stat().st_size / 1024 / 1024
-    console.print(f"  [green]✓[/green] {output}　[dim]({size_mb:.1f} MB)[/dim]")
+    # 完成提示就是娃娃机的爪子落下那一刻：文件名是用户第一眼要找的东西，
+    # 所以放在亮色主体里；完整路径与体积退到暗色，不抢视线。
+    console.print(f"  🎰 抓到了：[green]{output.name}[/green]　[dim]{output.parent} · {size_mb:.1f} MB[/dim]")
     for message in warnings:
         console.print(f"  [yellow]⚠[/yellow] {message}")
     return output
@@ -832,7 +839,7 @@ async def run(options: Options, console: Console) -> int:
                 succeeded.append(result)
 
     if failures and succeeded:
-        console.print(f"\n[yellow]完成 {len(succeeded)} 个，失败 {len(failures)} 个[/yellow]")
+        console.print(f"\n[yellow]🎰 抓到 {len(succeeded)} 个，失败 {len(failures)} 个[/yellow]")
         # 未完成的那几个还得再跑一次，给条能直接粘贴的命令（FR-11.5）
         console.print(f"[dim]→ 重跑：{reproduce_command()}[/dim]")
         return ExitCode.PARTIAL_FAILURE
@@ -902,7 +909,7 @@ def cli(
     version: bool = typer.Option(False, "--version", help="显示版本后退出"),
 ) -> None:
     if version:
-        typer.echo(f"bilidl {__version__}")
+        typer.echo(f"bili-claw {__version__}（哔哩娃娃机 / BiliClaw）")
         raise typer.Exit()
 
     if not url and not check:
@@ -952,7 +959,7 @@ def reproduce_command() -> str:
     整条命令要过一遍 :func:`redact`——``--cookie`` 的值就在 argv 里，原样回显会把
     凭据写进终端回滚缓冲，以及任何重定向过去的日志文件。
     """
-    return redact(" ".join(["bilidl", *(shlex.quote(part) for part in sys.argv[1:])]))
+    return redact(" ".join(["bili-claw", *(shlex.quote(part) for part in sys.argv[1:])]))
 
 
 def main() -> None:

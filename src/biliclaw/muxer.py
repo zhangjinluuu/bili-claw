@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .errors import BiliError, MissingDependencyError
 
-log = logging.getLogger("bilidl.muxer")
+log = logging.getLogger("biliclaw.muxer")
 
 #: 除了 PATH，常见的手动安装位置也找一遍——GUI 启动的进程常常没有完整 PATH。
 _FFMPEG_CANDIDATES = (

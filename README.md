@@ -1,10 +1,19 @@
-# bilidl — B站视频下载器
+# 🎰 哔哩娃娃机 / BiliClaw
+
+> **投币，出爪，把喜欢抓回家。**
 
 把 B站视频下载到本地，支持清晰度选择、登录态解锁 1080P+、DASH 音视频并发下载与 ffmpeg 无损合并。
 
+命令行是 `bili-claw`（短写 `bclaw`）：
+
+```console
+$ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
+  🎰 抓到了：住手 你们不要再摇花手了.mp4　downloads/神威-狗剩 · 8.5 MB
+```
+
 > **先说实话**：如果你只是想下载 B站视频，[yt-dlp](https://github.com/yt-dlp/yt-dlp) 已经做得非常完整了。
 > 这个项目的价值在于把「清晰度选择」这件事做对——B站会静默降级你的请求，绝大多数工具只告诉你
-> 它下到了什么，而不告诉你**为什么没拿到你要的那一档**。bilidl 的原则是：绝不静默降级。
+> 它下到了什么，而不告诉你**为什么没拿到你要的那一档**。BiliClaw 的原则是：绝不静默降级。
 
 ---
 
@@ -27,7 +36,7 @@
 # macOS
 brew install ffmpeg
 
-# 安装 bilidl
+# 安装 bili-claw
 cd bilibili_downloader
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
@@ -37,29 +46,29 @@ source .venv/bin/activate
 验证环境（会检查 ffmpeg 与登录态）：
 
 ```bash
-bilidl --check
+bili-claw --check
 ```
 
 ## 快速开始
 
 ```bash
 # 下载最高可用清晰度
-bilidl "https://www.bilibili.com/video/BV1xx411c7mD"
+bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
 
 # 只要 720P
-bilidl BV1xx411c7mD -q 720
+bili-claw BV1xx411c7mD -q 720
 
 # 先看看有哪些清晰度可选
-bilidl <URL> --list-qualities
+bili-claw <URL> --list-qualities
 
 # 只看信息不下载
-bilidl <URL> --info
+bili-claw <URL> --info
 
 # 下载多分P 的第 1~3 P
-bilidl <URL> -p 1-3
+bili-claw <URL> -p 1-3
 
 # 只要音频
-bilidl <URL> --audio-only
+bili-claw <URL> --audio-only
 ```
 
 ## 清晰度选择
@@ -77,7 +86,7 @@ bilidl <URL> --audio-only
 下不了，比不给选更糟。第一项是最好的那档，直接回车就等于 `-q max`：
 
 ```
-$ bilidl <URL> -q ask
+$ bili-claw <URL> -q ask
   #  清晰度  编码      码率  分辨率
   1  480P    avc   475 kbps  852×480
   2  480P    hevc  253 kbps  852×480
@@ -104,15 +113,15 @@ $ bilidl <URL> -q ask
 ### 档位不可用时怎么办
 
 B站的行为是：**你请求一个档位，它返回它能给的，并且不告诉你降级了。**
-bilidl 会把实际返回的流和你的请求对比，然后：
+bili-claw 会把实际返回的流和你的请求对比，然后：
 
 ```bash
 # 默认：降级 + 醒目提示
-$ bilidl <URL> -q 1080
+$ bili-claw <URL> -q 1080
   ⚠ 请求的 1080P 不可用，已降级为 480P；当前未登录（未登录上限 480P），且 1080P60 还需要大会员——先提供登录态（--cookie-file）
 
 # 严格：不满足就报错退出，不产出任何文件
-$ bilidl <URL> -q 1080 --on-unavailable fail
+$ bili-claw <URL> -q 1080 --on-unavailable fail
 ```
 
 严格模式下，退出码会区分两种截然不同的原因，方便脚本决定下一步：
@@ -132,14 +141,14 @@ $ bilidl <URL> -q 1080 --on-unavailable fail
 同档位可能有多种编码，体积和兼容性不同（AV1 最小、HEVC 次之、AVC 兼容性最好）：
 
 ```bash
-bilidl <URL> --codec avc,hevc     # 优先 AVC，其次 HEVC
-bilidl <URL> --codec-compat       # 等价于 --codec avc,hevc，最大兼容性
+bili-claw <URL> --codec avc,hevc     # 优先 AVC，其次 HEVC
+bili-claw <URL> --codec-compat       # 等价于 --codec avc,hevc，最大兼容性
 ```
 
 ## 登录态（1080P+ 的前提）
 
 **未登录最高只能拿到 480P**。1080P 及以上需要登录，4K/8K/HDR 还需要大会员。
-bilidl 不会代替你登录，你需要自己提供 Cookie：
+bili-claw 不会代替你登录，你需要自己提供 Cookie：
 
 1. 浏览器登录 B站
 2. 打开开发者工具 → Application → Cookies → `https://www.bilibili.com`
@@ -147,28 +156,32 @@ bilidl 不会代替你登录，你需要自己提供 Cookie：
 
 ```bash
 # 方式一：放到默认路径，之后所有命令自动带上，不用加参数（推荐）
-mkdir -p ~/.bilidl && chmod 700 ~/.bilidl
-printf '%s' 'SESSDATA=粘贴到这里; bili_jct=...' > ~/.bilidl/cookies.txt
-chmod 600 ~/.bilidl/cookies.txt
+mkdir -p ~/.biliclaw && chmod 700 ~/.biliclaw
+printf '%s' 'SESSDATA=粘贴到这里; bili_jct=...' > ~/.biliclaw/cookies.txt
+chmod 600 ~/.biliclaw/cookies.txt
 
 # 方式二：临时指定某个文件
-bilidl <URL> --cookie-file ~/bili-cookies.txt
+bili-claw <URL> --cookie-file ~/bili-cookies.txt
 
 # 方式三：直接传字符串
-bilidl <URL> --cookie "SESSDATA=xxx; bili_jct=yyy"
+bili-claw <URL> --cookie "SESSDATA=xxx; bili_jct=yyy"
 
 # 方式四：环境变量
-export BILIDL_COOKIE="SESSDATA=xxx"
-bilidl <URL>
+export BILICLAW_COOKIE="SESSDATA=xxx"
+bili-claw <URL>
 ```
 
 四种方式按 `--cookie` > `--cookie-file` > 环境变量 > 默认路径 的顺序生效。
 
-> ⚠️ Cookie 等同于账号凭据。bilidl 只把它放进请求头，不写入日志、不写入产物文件；
+> 改名（bilidl → BiliClaw）之前放在 `~/.bilidl/cookies.txt` 的文件**仍然会读**，
+> 只是排在新路径之后。想搬就搬，不搬也能用；两个路径都存在时以 `~/.biliclaw` 为准。
+> 环境变量同理，旧的 `BILIDL_COOKIE` 依旧生效。
+
+> ⚠️ Cookie 等同于账号凭据。bili-claw 只把它放进请求头，不写入日志、不写入产物文件；
 > `--debug` 输出里的 Cookie 也会自动脱敏。但仍然请勿把 Cookie 文件提交到版本库，
 > 并保持 `chmod 600`（仅本人可读）。
 
-放好之后用 `bilidl --check` 确认登录态**真的**生效了——它会显示账号名与大会员状态，
+放好之后用 `bili-claw --check` 确认登录态**真的**生效了——它会显示账号名与大会员状态，
 并告诉你这个账号最高能下到多高；如果 Cookie 已过期，会直接说「多半是 SESSDATA 过期了」
 并给出退出码 4，而不是含糊地报个网络错误。
 
@@ -200,7 +213,7 @@ bilidl <URL>
 以未登录身份继续下载——那会让你以为拿到了 1080P、其实只有 480P。它会直接停下：
 
 ```
-  ✗ Cookie 已失效（来源：/Users/you/.bilidl/cookies.txt）——B站不认为这是登录态
+  ✗ Cookie 已失效（来源：/Users/you/.biliclaw/cookies.txt）——B站不认为这是登录态
   → 多半是 SESSDATA 过期了。重新登录B站并复制一份新的 Cookie 覆盖它；
 ```
 
@@ -220,13 +233,13 @@ bilidl <URL>
 
 ```bash
 # 默认：downloads/{UP主}/{标题}.mp4
-bilidl <URL>
+bili-claw <URL>
 
 # 按 UP 主+分P 归档
-bilidl <URL> --template "{up}/{title}/P{p:02d}"
+bili-claw <URL> --template "{up}/{title}/P{p:02d}"
 
 # 扁平化，带 BV 号
-bilidl <URL> -o ~/Videos --template "{title} [{bvid}]"
+bili-claw <URL> -o ~/Videos --template "{title} [{bvid}]"
 ```
 
 多分P 下载时，如果模板里没用到 `{p}`，程序会自动补上 `_P01` 这样的后缀并明确告知，
@@ -253,11 +266,11 @@ bilidl <URL> -o ~/Videos --template "{title} [{bvid}]"
 中断（Ctrl-C、断网、关机）后**重新运行完全相同的命令**即可从断点继续：
 
 ```bash
-$ bilidl <URL> -q 1080
+$ bili-claw <URL> -q 1080
 ^C
 已中断。已下载的分片保存在 .part 文件中，重新运行同一命令会从断点继续。
 
-$ bilidl <URL> -q 1080     # 从断点继续
+$ bili-claw <URL> -q 1080     # 从断点继续
 ```
 
 「下载到哪了」以 `.part.json` 为准，**不是**看 `.part` 的大小——`.part` 是按完整长度预分配的，
@@ -274,7 +287,7 @@ uv pip install -e ".[dev]"
 项目结构：
 
 ```
-src/bilidl/
+src/biliclaw/
   cli.py         命令行入口、下载编排
   api.py         B站接口客户端（view / playurl / nav）
   wbi.py         WBI 签名（w_rid 计算）

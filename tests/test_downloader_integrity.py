@@ -18,8 +18,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from bilidl.downloader import StreamDownloader
-from bilidl.errors import BiliError, ExitCode, FileSystemError, NetworkError
+from biliclaw.downloader import StreamDownloader
+from biliclaw.errors import BiliError, ExitCode, FileSystemError, NetworkError
 
 #: 下载器允许的最小分片。用它来把测试负载压到几百 KiB，跑得快。
 CHUNK = 64 * 1024

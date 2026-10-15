@@ -46,7 +46,7 @@ DEFAULT_FNVAL = 4048
 #: ``data.wbi_img`` 依然有效，未登录本身就是我们想知道的信息。
 NOT_LOGGED_IN = -101
 
-log = logging.getLogger("bilidl.api")
+log = logging.getLogger("biliclaw.api")
 
 
 class BiliClient:

@@ -8,10 +8,10 @@ import sys
 import pytest
 from rich.console import Console
 
-from bilidl import cli, quality
-from bilidl.cli import Target, build_fields, main, parse_page_spec, parse_target_text, reproduce_command
-from bilidl.errors import AuthError, ExitCode, NetworkError, QualityUnavailableError, UsageError
-from bilidl.models import NavData, Owner, Page, VideoInfo
+from biliclaw import cli, quality
+from biliclaw.cli import Target, build_fields, main, parse_page_spec, parse_target_text, reproduce_command
+from biliclaw.errors import AuthError, ExitCode, NetworkError, QualityUnavailableError, UsageError
+from biliclaw.models import NavData, Owner, Page, VideoInfo
 
 # --------------------------------------------------------------------------- #
 # 稿件标识
@@ -219,7 +219,7 @@ def test_every_documented_template_variable_is_actually_provided() -> None:
     build_fields 里填，立刻就红——而不是等用户下载完才发现文件名里是个空位。
     模板变量拼错时 validate_template 会报错，但"变量存在却永远为空"不会。
     """
-    from bilidl.naming import TEMPLATE_FIELDS
+    from biliclaw.naming import TEMPLATE_FIELDS
 
     info = VideoInfo(bvid="BV1xx411c7mD", aid=2, title="标题", pubdate=1700000000, owner=Owner(mid=7, name="UP"))
     page = Page(cid=62131, page=3, part="第三话", duration=60)
@@ -233,14 +233,14 @@ def test_every_documented_template_variable_is_actually_provided() -> None:
 
 
 def test_reproduce_command_quotes_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD", "-o", "/tmp/my dir"])
-    assert reproduce_command() == "bilidl BV1xx411c7mD -o '/tmp/my dir'"
+    monkeypatch.setattr(sys, "argv", ["bili-claw", "BV1xx411c7mD", "-o", "/tmp/my dir"])
+    assert reproduce_command() == "bili-claw BV1xx411c7mD -o '/tmp/my dir'"
 
 
 def test_reproduce_command_redacts_cookie_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """FR-11.5 请用户把命令粘出来求助，FR-09 又不许凭据出现在输出里——两者会打架。"""
     monkeypatch.setattr(
-        sys, "argv", ["bilidl", "BV1xx411c7mD", "--cookie", "SESSDATA=secret123; bili_jct=abc456"]
+        sys, "argv", ["bili-claw", "BV1xx411c7mD", "--cookie", "SESSDATA=secret123; bili_jct=abc456"]
     )
     command = reproduce_command()
     assert "secret123" not in command
@@ -249,7 +249,7 @@ def test_reproduce_command_redacts_cookie_values(monkeypatch: pytest.MonkeyPatch
 
 
 def test_failure_prints_a_rerun_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD"])
+    monkeypatch.setattr(sys, "argv", ["bili-claw", "BV1xx411c7mD"])
 
     def _boom() -> None:
         raise NetworkError("下载中断")
@@ -258,14 +258,14 @@ def test_failure_prints_a_rerun_command(monkeypatch: pytest.MonkeyPatch, capsys:
     with pytest.raises(SystemExit) as caught:
         main()
     assert caught.value.code == int(ExitCode.NETWORK)
-    assert "重跑：bilidl BV1xx411c7mD" in capsys.readouterr().err
+    assert "重跑：bili-claw BV1xx411c7mD" in capsys.readouterr().err
 
 
 def test_usage_error_does_not_suggest_rerunning(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """参数错了就再跑一遍同一个命令，只会得到同一个错误。"""
-    monkeypatch.setattr(sys, "argv", ["bilidl", "BV1xx411c7mD", "-q", "99999"])
+    monkeypatch.setattr(sys, "argv", ["bili-claw", "BV1xx411c7mD", "-q", "99999"])
 
     def _boom() -> None:
         raise UsageError("无法识别的清晰度：99999")

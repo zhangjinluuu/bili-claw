@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bilidl.errors import (
+from biliclaw.errors import (
     API_ERROR_HINTS,
     ApiSchemaError,
     AuthError,

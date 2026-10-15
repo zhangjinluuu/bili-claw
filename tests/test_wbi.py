@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from bilidl.wbi import MIXIN_KEY_ENC_TAB, key_from_url, mixin_key, sign
+from biliclaw.wbi import MIXIN_KEY_ENC_TAB, key_from_url, mixin_key, sign
 
 # 公开的示例 wbi 密钥（来自 nav 接口的 wbi_img）。
 IMG_KEY = "7cd084941338484aae1ad9425b84077c"

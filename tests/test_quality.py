@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from bilidl.errors import AuthError, ExitCode, QualityUnavailableError, UsageError
-from bilidl.quality import (
+from biliclaw.errors import AuthError, ExitCode, QualityUnavailableError, UsageError
+from biliclaw.quality import (
     ANONYMOUS_MAX_QN,
     MAX_QN,
     AudioStream,

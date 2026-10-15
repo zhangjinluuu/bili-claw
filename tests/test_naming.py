@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from bilidl.errors import UsageError
-from bilidl.naming import (
+from biliclaw.errors import UsageError
+from biliclaw.naming import (
     TEMPLATE_FIELDS,
     render_path,
     render_template,

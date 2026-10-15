@@ -1,6 +1,7 @@
 """登录态（Cookie）加载与脱敏（FR-09）。
 
-优先级：``--cookie`` > ``--cookie-file`` > 环境变量 > 默认路径 ``~/.bilidl/cookies.txt``。
+优先级：``--cookie`` > ``--cookie-file`` > 环境变量 > 默认路径 ``~/.biliclaw/cookies.txt``
+（改名前的 ``~/.bilidl/cookies.txt`` 仍然会读，排在新的之后，老用户不用搬文件）。
 文件格式同时容忍三种写法——标准 Netscape cookies.txt（域名在前）、浏览器插件常见的
 「名字在前」变体、以及直接粘贴的一行 Cookie 头。
 """
@@ -14,13 +15,22 @@ from pathlib import Path
 
 from .errors import UsageError
 
-log = logging.getLogger("bilidl.cookies")
+log = logging.getLogger("biliclaw.cookies")
 
 #: 判断「是否已登录」的关键字段。
 SESSDATA_KEY = "SESSDATA"
 
-_ENV_NAMES = ("BILIDL_COOKIE", "BILI_COOKIE", "BILI_SESSDATA")
-DEFAULT_COOKIE_PATH = Path.home() / ".bilidl" / "cookies.txt"
+_ENV_NAMES = (
+    "BILICLAW_COOKIE",
+    "BILICLAW_SESSDATA",
+    # 改名（bilidl → biliclaw）之前的写法继续认，免得老用户的环境变量突然失效
+    "BILIDL_COOKIE",
+    "BILI_COOKIE",
+    "BILI_SESSDATA",
+)
+DEFAULT_COOKIE_PATH = Path.home() / ".biliclaw" / "cookies.txt"
+#: 改名前的默认路径。仍然会读，只是排在新路径之后。
+LEGACY_COOKIE_PATH = Path.home() / ".bilidl" / "cookies.txt"
 
 #: 形如 ``.bilibili.com``。用来判断这一行到底是「域名在前」还是「名字在前」。
 _DOMAIN_RE = re.compile(r"\.?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\Z")
@@ -188,8 +198,11 @@ def resolve_cookie(
         if raw:
             return parse_cookie_string(raw), f"环境变量 {name}"
 
-    if use_default_file and DEFAULT_COOKIE_PATH.is_file():
-        return load_from_file(DEFAULT_COOKIE_PATH), str(DEFAULT_COOKIE_PATH)
+    if use_default_file:
+        # 新路径优先；老路径只是后备，两者都存在时以新的为准。
+        for candidate in (DEFAULT_COOKIE_PATH, LEGACY_COOKIE_PATH):
+            if candidate.is_file():
+                return load_from_file(candidate), str(candidate)
 
     return {}, None
 
