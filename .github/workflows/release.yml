@@ -54,8 +54,23 @@ jobs:
         shell: bash
 
       # 构建、冒烟、归档都在这个脚本里——CI 与本地共用同一条路径
-      - run: bash packaging/build.sh
+      #
+      # tee 到文件是为了下面那一步：CI 的原始日志要登录才能下载，而 annotation
+      # 是匿名可读的。失败时把日志尾部转成 annotation，等于给"打不开日志的人"
+      # 留了一条能看到失败原因的通道。（`shell: bash` 自带 `-eo pipefail`，
+      # 所以 tee 不会把脚本的退出码吃掉。）
+      - run: bash packaging/build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
         shell: bash
+
+      - name: 失败时把日志尾部转成注解
+        if: failure()
+        shell: bash
+        run: |
+          # GitHub 会为每个 ::error:: 生成一条 annotation，匿名可读。
+          # 逐行发是为了保留原始换行——整块塞进一条会被截断。
+          tail -n 40 "$RUNNER_TEMP/build.log" 2>/dev/null | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done || true
 
       - uses: actions/upload-artifact@v4
         with:
