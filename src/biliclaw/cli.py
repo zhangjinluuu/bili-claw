@@ -50,12 +50,14 @@ from .models import Page, PlayUrlData, VideoInfo
 from .muxer import choose_container, find_ffmpeg, merge, verify_output
 from .naming import TEMPLATE_FIELDS, render_path, template_fields, validate_template
 from .progress import ProgressReporter
+from .selftest import check_merge
 
 app = typer.Typer(
     add_completion=False,
     help=(
         "哔哩娃娃机 / BiliClaw —— 投币，出爪，把喜欢抓回家。\n\n"
-        "支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与 ffmpeg 无损合并。"
+        "支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与内置的无损合并。\n\n"
+        "合并由本程序自己完成，不需要 ffmpeg 等任何外部程序。"
     ),
 )
 
@@ -67,6 +69,11 @@ SHORT_LINK_PATTERN = re.compile(r"https?://b23\.tv/[0-9A-Za-z]+", re.IGNORECASE)
 PAGE_QUERY_PATTERN = re.compile(r"[?&]p=(\d+)")
 
 DEFAULT_TEMPLATE = "{up}/{title}"
+
+#: 只有预计超过一秒的合并才值得显示进度条。按实测吞吐（129 MB / 0.25 s，约 500 MB/s）
+#: 折算，这条线大致落在 512 MB——17 分钟的 1080P 远在其下，4K 长片会跨过去。
+#: 短操作上闪一下的进度条比没有更糟：用户会以为界面出了毛病。
+MERGE_PROGRESS_THRESHOLD = 512 * 1024 * 1024
 
 
 # --------------------------------------------------------------------------- #
@@ -599,17 +606,22 @@ async def process_page(
         console.print(f"  [green]✓[/green] 已下载分片（--no-merge 未合并）：{video_temp}")
         return video_temp
 
-    output = await merge(
-        video=video_temp,
-        audio=audio_temp if audio is not None else None,
-        dest=dest,
-        container=container,
-        video_codec=stream.codec if stream else None,
-    )
+    merge_total = sum(path.stat().st_size for path in (video_temp, audio_temp) if path.exists())
+    slow_enough_to_show = not options.quiet and merge_total >= MERGE_PROGRESS_THRESHOLD
+    with ProgressReporter(console, enabled=slow_enough_to_show) as bar:
+        task = bar.add(f"P{page.page} 合并", total=merge_total)
+        output = await merge(
+            video=video_temp,
+            audio=audio_temp if audio is not None else None,
+            dest=dest,
+            container=container,
+            video_codec=stream.codec if stream else None,
+            progress=lambda done, _total, t=task: bar.set_completed(t, done),
+        )
 
     # FR-05.4：清理分片之前先确认产物真的完整。校验不过会抛错，于是下面的清理不会
     # 执行，分片保留下来供排查（FR-05.5）。
-    warnings = await verify_output(
+    warnings = verify_output(
         output,
         expect_video=True,
         expect_audio=audio is not None,
@@ -673,31 +685,42 @@ async def _refresh_audio(
 
 
 async def run_check(options: Options, console: Console) -> int:
-    """``--check``：确认依赖与登录态，便于安装后第一时间发现问题（对应 E2E-9）。
+    """``--check``：确认运行环境与登录态，便于安装后第一时间发现问题（对应 E2E-9）。
 
     返回最具体的那一个退出码（FR-11），而不是笼统的失败码——脚本据此就能判断
-    是该装 ffmpeg、该查网络，还是该重新登录。
+    是该查网络，还是该重新登录。
     """
     code = ExitCode.OK
 
     def failed(candidate: ExitCode) -> None:
         """只让第一个失败原因占据退出码。
 
-        三项检查是依次做的，后面发现问题时不该把前面的结论冲掉：没有 ffmpeg 又刚好
-        断网时，真正该先解决的是装 ffmpeg（退出码 6），而不是让人去排查网络。
-        顺序本身编码了优先级：依赖 → 网络/登录态。
+        各项检查是依次做的，后面发现问题时不该把前面的结论冲掉。
+        顺序本身编码了优先级：网络 → 登录态。
         """
         nonlocal code
         if code is ExitCode.OK:
             code = candidate
 
+    # 合并已经不依赖任何外部程序了，所以 ffmpeg 的有无**不再是失败**。这里只是如实
+    # 报告能力边界：没有它照样能下 MP4，只是用不了 --container mkv。
+    #
+    # 光说"内置"是一句承诺，用户没法验证；所以现场拿内置样本合并一次。这一步是打包
+    # 之后唯一能在用户机器上发现"这个构建的合并坏了"的地方——不然要等下完几百 MB
+    # 才发现产物打不开。
+    failure = check_merge()
+    if failure:
+        failed(ExitCode.MISSING_DEPENDENCY)
+        console.print(f"[red]✗[/red] 合并：内置内核自检失败　[dim]{failure}[/dim]")
+        console.print("  [dim]· 这是安装包本身的问题，不是你的环境问题——请重新安装，或反馈这条信息[/dim]")
+    else:
+        console.print("[green]✓[/green] 合并：内置纯 Python（自检通过）")
+
     ffmpeg = find_ffmpeg()
     if ffmpeg:
-        console.print(f"[green]✓[/green] ffmpeg：{ffmpeg}")
+        console.print(f"  [dim]· ffmpeg {ffmpeg}——只有 --container mkv 会用到它[/dim]")
     else:
-        failed(ExitCode.MISSING_DEPENDENCY)
-        console.print("[red]✗[/red] 未找到 ffmpeg——音视频合并无法进行（退出码 6）")
-        console.print("  [dim]→ macOS: brew install ffmpeg[/dim]")
+        console.print("  [dim]· 未装 ffmpeg——只有 --container mkv 会用到它，不影响 MP4[/dim]")
 
     cookies, source = resolve_cookie(explicit=options.cookie, cookie_file=options.cookie_file)
     has_cookie = is_logged_in(cookies)
@@ -958,7 +981,7 @@ def cli(
     retries: int = typer.Option(3, "--retries", help="网络重试次数"),
     list_qualities: bool = typer.Option(False, "--list-qualities", help="只列出可用清晰度，不下载"),
     info_only: bool = typer.Option(False, "--info", help="只显示视频信息，不下载"),
-    check: bool = typer.Option(False, "--check", help="检查 ffmpeg 与登录态后退出"),
+    check: bool = typer.Option(False, "--check", help="检查运行环境与登录态后退出"),
     login: bool = typer.Option(
         False, "--login", help="从本机浏览器取 B站 Cookie 存下来并验证，可单独使用"
     ),
@@ -967,7 +990,7 @@ def cli(
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="覆盖已存在的文件（默认跳过）"),
     keep_parts: bool = typer.Option(False, "--keep-parts", help="合并后保留 .m4s 分片"),
-    no_merge: bool = typer.Option(False, "--no-merge", help="只下载分片，不调用 ffmpeg 合并"),
+    no_merge: bool = typer.Option(False, "--no-merge", help="只下载分片，不合并"),
     quiet: bool = typer.Option(False, "-Q", "--quiet", help="不显示进度条"),
     debug: bool = typer.Option(False, "--debug", help="输出调试日志（会自动脱敏 Cookie）"),
     version: bool = typer.Option(False, "--version", help="显示版本后退出"),

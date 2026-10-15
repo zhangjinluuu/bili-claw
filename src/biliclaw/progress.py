@@ -69,6 +69,15 @@ class ProgressReporter:
         if self._progress is not None and task is not None and amount:
             self._progress.update(task, advance=amount)
 
+    def set_completed(self, task: _TASK_ID, completed: int) -> None:
+        """按**累计值**校正进度。
+
+        下载回调给的是增量（``advance``），而合并回调给的是"已经写了多少字节"——
+        让调用方自己记上一个值再相减，是在每一步都重新算一遍同样的账。
+        """
+        if self._progress is not None and task is not None:
+            self._progress.update(task, completed=completed)
+
     def set_total(self, task: _TASK_ID, total: int) -> None:
         """探测到真实长度后校正总数。"""
         if self._progress is not None and task is not None and total > 0:
