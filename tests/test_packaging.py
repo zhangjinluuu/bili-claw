@@ -20,6 +20,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+ATTRIBUTES = ROOT / ".gitattributes"
 
 #: `$NAME` / `${NAME}` 的写法，用于判断变量名后面紧跟了什么。
 _VARIABLE = re.compile(r"(?<![\\$])\$\{?([A-Za-z_]\w*)\}?")
@@ -79,12 +80,57 @@ def test_no_variable_is_glued_to_a_non_ascii_character(path: Path) -> None:
     )
 
 
-def test_build_smoke_test_uses_selftest_not_check() -> None:
-    """冒烟测试必须用 `--selftest`，不能 grep `--check` 的中文输出。
+def test_shell_scripts_are_pinned_to_lf() -> None:
+    """`.gitattributes` 必须把 `*.sh` 钉成 LF——这是 Windows 构建失败的真正根因。
 
-    Windows 控制台的默认代码页不是 UTF-8，`grep "自检通过"` 在那边永远不匹配，
-    于是 Windows CI 整个 job 失败——而失败信息看起来像"合并内核坏了"，排查方向
-    完全是错的。`--selftest` 是给脚本判读的：纯 ASCII、不碰网络、退出码即结论。
+    Windows runner 的系统 git 配置是 `core.autocrlf=true`，没有 `.gitattributes`
+    时检出会得到 CRLF 的 `build.sh`。bash 随后把回车当成选项名的一部分：
+
+        build.sh: line 19: : command not found
+        build.sh: line 19: set: pipefail: invalid option name
+
+    脚本在第三行就死了，错误信息里既没有 "windows"，也没有任何指向换行符的线索——
+    四个平台里只有 Windows 挂，而且挂得完全看不出原因。本地能复现：
+
+        git show HEAD:packaging/build.sh | sed 's/$/\\r/' > /tmp/b.sh && bash /tmp/b.sh
+
+    （这条断言和上面那条"用 --selftest 不用 --check"曾经指向同一个故障，但那条
+    的诊断是错的：PyInstaller 冻结后的 `sys.stdout.encoding` 恒为 utf-8，中文输出
+    在 Windows 上并不会丢。真正的原因是换行符。--selftest 仍然保留，理由变成了
+    "它是给脚本判读的信号：纯 ASCII、不碰网络、退出码即结论"。）
+    """
+    assert ATTRIBUTES.is_file(), "缺了 .gitattributes，Windows 检出会得到 CRLF 的 shell 脚本"
+    text = _strip_comments(ATTRIBUTES.read_text(encoding="utf-8"))
+    assert re.search(r"^\*\.sh\s+text\s+eol=lf\s*$", text, re.MULTILINE), (
+        "`*.sh` 必须显式钉成 `text eol=lf`；只靠 `* text=auto` 挡不住 autocrlf=true"
+    )
+
+
+@pytest.mark.parametrize("path", _shell_scripts(), ids=lambda p: p.name)
+def test_shell_scripts_in_the_working_tree_have_no_carriage_return(path: Path) -> None:
+    """工作区里的 shell 脚本此刻就必须是 LF——CRLF 的话它根本跑不起来。
+
+    上一条断言守的是"规则还在"，这一条守的是"规则真的生效了"。`.gitattributes`
+    写对了但没被应用（比如文件加得太晚、或本地 `core.autocrlf` 已经改过工作区）
+    时，测试会在这里红，而不是等到 Windows CI 上。
+    """
+    raw = path.read_bytes()
+    assert b"\r\n" not in raw, f"{path.name} 含 CRLF 换行，bash 会在 set -euo pipefail 那行直接死掉"
+
+
+def test_build_smoke_test_uses_selftest_not_check() -> None:
+    """冒烟测试必须用 `--selftest`，不能靠 grep `--check` 的中文输出。
+
+    早期版本是 `"$BIN" --check | grep -q "自检通过"`。那个写法有两处不好：判读依赖
+    人读的文案（文案一改，CI 就红），而且 Windows 上真的整个 job 失败过一次。
+
+    当时把原因归结为"Windows 控制台代码页不是 UTF-8，grep 匹配不上中文"，事后证明
+    **那个诊断是错的**——PyInstaller 冻结后 `sys.stdout.encoding` 恒为 `utf-8`，
+    中文照样输出（真正的故障是 `.gitattributes` 缺位导致的 CRLF，见上）。
+
+    但 `--selftest` 依然该留着，理由换成了更站得住的那个：它是**给脚本判读的信号**，
+    不是给人读的文案——纯 ASCII、不碰网络、退出码就是结论，三个平台的判读方式完全
+    一致。文案怎么改都不会影响 CI。
     """
     text = _strip_comments((PACKAGING / "build.sh").read_text(encoding="utf-8"))
     assert "--selftest" in text

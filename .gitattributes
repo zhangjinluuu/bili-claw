@@ -1,0 +1,36 @@
+# 换行符必须钉死，不能交给各平台的 git 默认值决定。
+#
+# 为什么需要这个文件（首次发版 Windows 构建失败的根因）：
+#
+#   Windows runner 的系统 git 配置是 core.autocrlf=true，检出时会把文本文件的 LF
+#   换成 CRLF。而 bash 读到 `set -euo pipefail\r` 会把回车当成选项名的一部分，直接
+#   报 `set: pipefail: invalid option name` 并以 1 退出——脚本在第三行就死了，错误
+#   信息里既没有 "windows"，也没有任何指向换行符的线索。macOS 与 Linux runner 上
+#   LF 原样保留，所以四个平台里只有 Windows 挂，挂的方式还完全看不出原因。
+#
+#   仓库里存的一直是 LF（`git show HEAD:packaging/build.sh | file -` 报 UTF-8 text
+#   而不是 "with CRLF line terminators"），所以补上这个文件**不会改动任何已有内容**，
+#   只是让 Windows 检出时不再擅自转换。
+
+# 默认：文本文件按 LF 检出。跨平台项目里，让不同机器拿到不同字节是麻烦的源头。
+* text=auto eol=lf
+
+# shell 脚本是上面那条规则唯一的"硬需求"——CRLF 会让它们直接无法执行。
+*.sh text eol=lf
+
+# Windows 上这两类文件反而要 CRLF：cmd.exe 的解析器对 LF 支持不可靠。
+# PowerShell 5.1 处理 LF-only 脚本也有已知的边角问题（here-string、行继续），
+# 而 install.ps1 是通过 `irm | iex` 直接喂给 PowerShell 的，保持平台惯例最稳。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制不进文本转换，否则会被"换行符规范化"改坏。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.tar.gz binary
