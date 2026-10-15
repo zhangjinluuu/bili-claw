@@ -7,8 +7,8 @@
 命令行是 `bili-claw`（短写 `bclaw`）：
 
 ```console
-$ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
-  🎰 抓到了：住手 你们不要再摇花手了.mp4　downloads/神威-狗剩 · 8.5 MB
+$ bclaw BV17wpp6SEe9 -q 1080
+  🎰 抓到了：改写战局！多库替补造2球+造红牌 哈兰德破门 十人利物浦0比3曼城.mp4　downloads/吉罗很快乐 · 524.4 MB
 ```
 
 > 这个项目的价值在于把「清晰度选择」这件事做对——B站会静默降级你的请求，绝大多数工具只告诉你
@@ -53,32 +53,32 @@ source .venv/bin/activate
 验证环境（会检查 ffmpeg 与登录态）：
 
 ```bash
-bili-claw --check
+bclaw --check
 ```
 
 ## 快速开始
 
 ```bash
 # 第一次用：从浏览器取一份 Cookie，解锁 1080P+
-bili-claw --login
+bclaw --login
+
+# 下载 1080P（本文档其余示例都用这个视频）
+bclaw BV17wpp6SEe9 -q 1080
 
 # 下载最高可用清晰度
-bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
-
-# 只要 720P
-bili-claw BV1xx411c7mD -q 720
+bclaw BV17wpp6SEe9
 
 # 先看看有哪些清晰度可选
-bili-claw <URL> --list-qualities
+bclaw BV17wpp6SEe9 --list-qualities
 
 # 只看信息不下载
-bili-claw <URL> --info
+bclaw BV17wpp6SEe9 --info
 
 # 下载多分P 的第 1~3 P
-bili-claw <URL> -p 1-3
+bclaw BV17wpp6SEe9 -p 1-3
 
 # 只要音频
-bili-claw <URL> --audio-only
+bclaw BV17wpp6SEe9 --audio-only
 ```
 
 ## 清晰度选择
@@ -96,15 +96,29 @@ bili-claw <URL> --audio-only
 下不了，比不给选更糟。第一项是最好的那档，直接回车就等于 `-q max`：
 
 ```
-$ bili-claw <URL> -q ask
-  #  清晰度  编码      码率  分辨率
-  1  480P    avc   475 kbps  852×480
-  2  480P    hevc  253 kbps  852×480
-  3  480P    av1   227 kbps  852×480
-  4  360P    avc   330 kbps  640×360
-  请选择要下载的清晰度 (1): 4
-  ✓ 已选择 360P · 640×360 · 30fps · avc · 330 kbps
+$ bclaw BV17wpp6SEe9 -q ask
+  ℹ 清晰度：交互选择——将列出当前账号实际可下载的档位
+
+  ▶ P1 改写战局！多库替补造2球+造红牌 哈兰德破门 十人利物浦0比3曼城
+   #  清晰度  编码       码率  分辨率
+   1  1080P   avc   3990 kbps  1920×1080
+   2  1080P   hevc  1581 kbps  1920×1080
+   3  1080P   av1   1552 kbps  1920×1080
+   4  720P    avc   1726 kbps  1280×720
+   5  720P    hevc   775 kbps  1280×720
+   6  720P    av1    760 kbps  1280×720
+   7  480P    avc    818 kbps  852×480
+   8  480P    hevc   441 kbps  852×480
+   9  480P    av1    437 kbps  852×480
+  10  360P    avc    637 kbps  640×360
+  11  360P    hevc   297 kbps  640×360
+  12  360P    av1    295 kbps  640×360
+   请选择要下载的清晰度 (1): 2
+  ✓ 已选择 1080P · 1920×1080 · 30fps · hevc · 1581 kbps
 ```
+
+同一个 1080P 有 avc / hevc / av1 三种编码，码率差到 2.5 倍（3990 vs 1552 kbps）——
+体积和兼容性怎么取舍见下方的「编码偏好」。
 
 `ask` 需要交互式终端。在脚本或管道里它会立刻报错并告诉你可选的档位，而不是
 挂在那里等输入——自动化命令卡住等按键是最难排查的一种失败。
@@ -126,12 +140,22 @@ B站的行为是：**你请求一个档位，它返回它能给的，并且不�
 bili-claw 会把实际返回的流和你的请求对比，然后：
 
 ```bash
-# 默认：降级 + 醒目提示
-$ bili-claw <URL> -q 1080
-  ⚠ 请求的 1080P 不可用，已降级为 480P；当前未登录（未登录上限 480P），且 1080P60 还需要大会员——先提供登录态（--cookie-file）
+# 默认：降级 + 醒目提示（这个账号没有大会员，8K 拿不到）
+$ bclaw BV17wpp6SEe9 -q 4320
+  ⚠ 请求的 4320P 不可用，已降级为 1080P
 
 # 严格：不满足就报错退出，不产出任何文件
-$ bili-claw <URL> -q 1080 --on-unavailable fail
+$ bclaw BV17wpp6SEe9 -q 4320 --on-unavailable fail
+  ✗ 请求的 4320P 不可用，已降级为 1080P，且当前是严格模式
+    去掉 --on-unavailable=fail 即可自动降级到可用档位；或改用该视频实际提供的档位
+  （退出码 2 —— 这条片源最高就到 1080P，去开大会员也没用）
+```
+
+未登录时同样会如实说明挡在哪：
+
+```bash
+$ bclaw BV17wpp6SEe9 -q 1080          # 未提供登录态
+  ⚠ 请求的 1080P 不可用，已降级为 480P；当前未登录（未登录上限 480P），且 1080P60 还需要大会员——先提供登录态（--cookie-file）
 ```
 
 严格模式下，退出码会区分两种截然不同的原因，方便脚本决定下一步：
@@ -151,8 +175,8 @@ $ bili-claw <URL> -q 1080 --on-unavailable fail
 同档位可能有多种编码，体积和兼容性不同（AV1 最小、HEVC 次之、AVC 兼容性最好）：
 
 ```bash
-bili-claw <URL> --codec avc,hevc     # 优先 AVC，其次 HEVC
-bili-claw <URL> --codec-compat       # 等价于 --codec avc,hevc，最大兼容性
+bclaw BV17wpp6SEe9 --codec avc,hevc     # 优先 AVC，其次 HEVC
+bclaw BV17wpp6SEe9 --codec-compat       # 等价于 --codec avc,hevc，最大兼容性
 ```
 
 ## 登录态（1080P+ 的前提）
@@ -164,7 +188,7 @@ bili-claw <URL> --codec-compat       # 等价于 --codec avc,hevc，最大兼容
 只要你在本机浏览器里登录过 B站，就不用去开发者工具里翻：
 
 ```bash
-bili-claw --login
+bclaw --login
 ```
 
 ```
@@ -181,9 +205,9 @@ B站 Cookie，写到默认路径（权限 `600`），**并当场向B站验证一
 也可以和下载连起来一条命令做完：
 
 ```bash
-bili-claw <URL> --login -q 1080      # 取完 Cookie 直接下这一条
-bili-claw --login --cookie-file ~/bili-cookies.txt   # 写到别处
-bili-claw --login --browser firefox  # 指定浏览器（默认 auto，按 Chrome 系优先）
+bclaw BV17wpp6SEe9 --login -q 1080      # 取完 Cookie 直接下这一条
+bclaw --login --cookie-file ~/bili-cookies.txt   # 写到别处
+bclaw --login --browser firefox  # 指定浏览器（默认 auto，按 Chrome 系优先）
 ```
 
 macOS 上读 Chrome 系 Cookie 需要解密钥匙串里的密钥，**首次可能弹一次系统授权框**，
@@ -204,14 +228,14 @@ printf '%s' 'SESSDATA=粘贴到这里; bili_jct=...' > ~/.biliclaw/cookies.txt
 chmod 600 ~/.biliclaw/cookies.txt
 
 # 方式二：临时指定某个文件
-bili-claw <URL> --cookie-file ~/bili-cookies.txt
+bclaw BV17wpp6SEe9 --cookie-file ~/bili-cookies.txt
 
 # 方式三：直接传字符串
-bili-claw <URL> --cookie "SESSDATA=xxx; bili_jct=yyy"
+bclaw BV17wpp6SEe9 --cookie "SESSDATA=xxx; bili_jct=yyy"
 
 # 方式四：环境变量
 export BILICLAW_COOKIE="SESSDATA=xxx"
-bili-claw <URL>
+bclaw BV17wpp6SEe9
 ```
 
 四种方式按 `--cookie` > `--cookie-file` > 环境变量 > 默认路径 的顺序生效，
@@ -279,13 +303,13 @@ bili-claw <URL>
 
 ```bash
 # 默认：downloads/{UP主}/{标题}.mp4
-bili-claw <URL>
+bclaw BV17wpp6SEe9
 
 # 按 UP 主+分P 归档
-bili-claw <URL> --template "{up}/{title}/P{p:02d}"
+bclaw BV17wpp6SEe9 --template "{up}/{title}/P{p:02d}"
 
 # 扁平化，带 BV 号
-bili-claw <URL> -o ~/Videos --template "{title} [{bvid}]"
+bclaw BV17wpp6SEe9 -o ~/Videos --template "{title} [{bvid}]"
 ```
 
 多分P 下载时，如果模板里没用到 `{p}`，程序会自动补上 `_P01` 这样的后缀并明确告知，
@@ -312,11 +336,11 @@ bili-claw <URL> -o ~/Videos --template "{title} [{bvid}]"
 中断（Ctrl-C、断网、关机）后**重新运行完全相同的命令**即可从断点继续：
 
 ```bash
-$ bili-claw <URL> -q 1080
+$ bclaw BV17wpp6SEe9 -q 1080
 ^C
 已中断。已下载的分片保存在 .part 文件中，重新运行同一命令会从断点继续。
 
-$ bili-claw <URL> -q 1080     # 从断点继续
+$ bclaw BV17wpp6SEe9 -q 1080     # 从断点继续
 ```
 
 「下载到哪了」以 `.part.json` 为准，**不是**看 `.part` 的大小——`.part` 是按完整长度预分配的，
@@ -338,10 +362,11 @@ src/biliclaw/
   api.py         B站接口客户端（view / playurl / nav）
   wbi.py         WBI 签名（w_rid 计算）
   cookies.py     Cookie 加载、校验、脱敏
+  browser.py     从本机浏览器提取 Cookie（--login）
   models.py      接口响应数据模型
   quality.py     清晰度协商与降级判定
   downloader.py  分片并发下载与断点续传
-  muxer.py       ffmpeg 无损合并
+  muxer.py       ffmpeg 无损合并 + 合并后校验
   naming.py      模板渲染与文件名净化
   progress.py    进度展示
   errors.py      错误分类与退出码
