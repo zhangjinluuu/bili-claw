@@ -1,0 +1,91 @@
+name: release
+
+# 打 tag 就发版；平时改到打包相关的东西也跑一遍，免得等到发版那天才发现 CI 坏了。
+#
+# 为什么要五个 runner 而不是一个：**PyInstaller 不能交叉编译**。它把当前解释器
+# 和当前平台的二进制依赖一起塞进产物，所以在 macOS 上编不出 Windows 的东西。
+# 这不是配置问题，是原理问题——每个平台必须在自己的机器上构建一次。
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.tag }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # 一个平台挂了不该把其它平台的成功结果一起丢掉——五个平台各修各的。
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14,         tag: macos-arm64 }
+          # macOS x64 用 macos-13：GitHub 只有这一档是 Intel 机器
+          - { runner: macos-13,         tag: macos-x64 }
+          - { runner: windows-latest,   tag: windows-x64 }
+          # Linux x64 刻意钉在 22.04（最老的受支持 LTS）而不是 ubuntu-latest。
+          # glibc 向前兼容、向后不兼容：在 24.04 上编出来的二进制在 22.04 上会
+          # 因为 glibc 太新而直接跑不起来。反过来则没问题。钉老了能跑新的，
+          # 钉新了老的用户全废——这是单向的，没有折中。
+          - { runner: ubuntu-22.04,     tag: linux-x64 }
+          - { runner: ubuntu-24.04-arm, tag: linux-arm64 }
+          # Windows arm64 不做：没有现成的 runner，也没有真实需求。
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # 三平台统一钉 3.12：产物里嵌的是这个解释器，版本漂了体积与行为都会跟着漂。
+      - run: uv python install 3.12
+        shell: bash
+
+      # 构建、冒烟、归档都在这个脚本里——CI 与本地共用同一条路径
+      - run: bash packaging/build.sh
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bclaw-${{ matrix.tag }}
+          path: release/*
+          if-no-files-found: error
+          # 归档本身已是压缩格式，再压一遍只是浪费 CI 时间
+          compression-level: 0
+
+  # 五个产物都齐了才发 Release。少一个平台的包比晚半小时发布糟得多——
+  # 用户拿到的是一个「表里不一」的版本页。
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      # 安装脚本挂到 Release 上，安装命令才能写成一条不用 clone 的 curl。
+      # 它们必须与产物同源同版本：脚本里认识的文件名变了，安装就会静默 404。
+      - run: cp packaging/install.sh packaging/install.ps1 release/
+
+      - run: ls -l release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          # 预发布：等到三平台各按文档从零装一次（P3 验收第 2 条）再手动转正
+          prerelease: true

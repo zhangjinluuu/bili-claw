@@ -19,5 +19,9 @@ cookies.txt
 .ruff_cache/
 dist/
 build/
+release/
 *.egg-info/
 .DS_Store
+
+# PyInstaller 的构建配置（由 spec 生成，不是手写的源文件）
+*.spec.bak
