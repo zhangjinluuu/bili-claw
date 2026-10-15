@@ -2,7 +2,7 @@
 
 > **投币，出爪，把热爱抓回家。**
 
-把 B站视频下载到本地，支持清晰度选择、登录态解锁 1080P+、DASH 音视频并发下载与 ffmpeg 无损合并。
+把 B站视频下载到本地，支持清晰度选择、登录态解锁 1080P+、DASH 音视频并发下载与**内置的无损合并**。
 
 命令行是 `bili-claw`（短写 `bclaw`）：
 
@@ -22,39 +22,69 @@ $ bclaw BV17wpp6SEe9 -q 1080
 - **降级必须告知**：请求 4K 但账号没有大会员时，会明确告诉你实际拿到了什么、为什么
 - **严格模式**：`--on-unavailable fail` 让档位不匹配直接报错退出，适合脚本
 - **登录态解锁**：支持 Cookie 文件，1080P / 1080P+ / 4K / 8K 按账号权限如实反映
-- **一键取 Cookie**：`--login` 直接读本机 Chrome / Edge / Brave / Firefox 的 Cookie 并当场验证
+- **一键取 Cookie**：`--login` 直接读本机浏览器的 Cookie 并当场验证（支持矩阵见下）
 - **DASH 并发下载**：视频流多分片并发 + 断点续传，中断后重跑同一命令即可继续
 - **CDN 链接过期自动换链**：B站下载链接约 2 小时失效，遇 403 自动重新请求 playurl
-- **无损合并**：只做 remux（`-c copy`），不重新编码，画质音质零损失
+- **无损合并，且不依赖 ffmpeg**：合并由程序自己完成，只做 remux，不重新编码，画质音质零损失
 - **机器可用的退出码**：0/1/2/3/4/5/6/7 区分成功、部分失败、参数错误、网络、权限、风控、缺依赖、磁盘
 
 ## 安装
 
-需要 **Python 3.12+** 与 **ffmpeg**。
+**下载一个文件，直接跑。** 不需要 Python，不需要 ffmpeg，不需要任何运行时。
 
 ```bash
-# 先拿到源码
+# macOS（Apple 芯片）
+curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/latest/download/bclaw-macos-arm64.tar.gz \
+  | tar xz -C ~/.local/bin
+
+# Linux（x64）
+curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/latest/download/bclaw-linux-x64.tar.gz \
+  | tar xz -C ~/.local/bin
+```
+
+Windows（PowerShell）：
+
+```powershell
+irm https://github.com/zhangjinluuu/bili-claw/releases/latest/download/install.ps1 | iex
+```
+
+验证环境：
+
+```bash
+bclaw --check
+```
+
+> **为什么用 `curl` 而不是去 Release 页面点下载？** 这不是风格偏好。浏览器下载的文件会被打上
+> 隔离标记（macOS 的 `com.apple.quarantine`、Windows 的 Mark-of-the-Web），于是 macOS 报
+> 「已损坏，无法打开」、Windows 弹 SmartScreen 警告。用命令行工具下载**不产生这个标记**，
+> 等于绕过了代码签名问题——而正式解决它需要一年 $99 的 Apple 开发者账号。
+
+<details>
+<summary>从源码安装（开发用）</summary>
+
+需要 **Python 3.12+**。**不再需要 ffmpeg**——MP4 合并已经是内置的了。
+
+```bash
 git clone https://github.com/zhangjinluuu/bili-claw.git
 cd bili-claw
 
-# macOS 装 ffmpeg
-brew install ffmpeg
-
-# 方式一：装成全局命令（推荐，装完在任何目录都能用 bili-claw / bclaw）
+# 装成全局命令（推荐，装完在任何目录都能用 bili-claw / bclaw）
 uv tool install --editable .
 uv tool update-shell          # 把 ~/.local/bin 加进 PATH，重开终端生效
 
-# 方式二：用项目自己的虚拟环境
+# 或者用项目自己的虚拟环境
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
 source .venv/bin/activate
 ```
 
-验证环境（会检查 ffmpeg 与登录态）：
+自己打一份单文件产物：
 
 ```bash
-bclaw --check
+bash packaging/build.sh       # → release/bclaw-<平台>.tar.gz
 ```
+
+</details>
 
 ## 快速开始
 
@@ -202,6 +232,23 @@ bclaw --login
 B站 Cookie，写到默认路径（权限 `600`），**并当场向B站验证一次**——所以上面那行
 「验证通过」是真实结果，不是「文件写好了」的另一种说法。
 
+#### 各平台支持情况
+
+| | Chromium 系（Chrome / Edge / Brave / Chromium / Vivaldi） | Firefox |
+|---|---|---|
+| **macOS** | ✅ 需要钥匙串授权（首次可能弹一次框） | ✅ **推荐**，无需授权 |
+| **Linux** | ✅ gnome-keyring；取不到就用 Chromium 的固定口令 | ✅ **推荐** |
+| **Windows** | ⚠️ 仅旧版加密；**Chrome / Edge 127+ 的 App-Bound 加密不支持** | ✅ **推荐** |
+
+**三个平台的加密方式互不相同**，不是同一个东西换个名字：macOS 是钥匙串口令派生
+AES-128、Linux 用同一套但**迭代次数不同**、Windows 是 DPAPI 保护的 AES-256 密钥。
+所以「在我机器上能用」不代表在别的平台也能用。
+
+> **Windows 用户注意**：如果 Chrome / Edge 报「Cookie 用了 App-Bound 加密，本程序解不开」，
+> **去浏览器重新登录是没用的**——Cookie 明明存着，只是密钥只有浏览器自己拿得到。这是
+> Chrome 127+ 的新方案，本工具不做（正规解法只有从浏览器进程里读内存，那和恶意软件的手法
+> 没有区别）。请改用 Firefox，或用手动方式提供 Cookie。
+
 也可以和下载连起来一条命令做完：
 
 ```bash
@@ -210,11 +257,10 @@ bclaw --login --cookie-file ~/bili-cookies.txt   # 写到别处
 bclaw --login --browser firefox  # 指定浏览器（默认 auto，按 Chrome 系优先）
 ```
 
-macOS 上读 Chrome 系 Cookie 需要解密钥匙串里的密钥，**首次可能弹一次系统授权框**，
-允许即可；这一步是系统管的，bili-claw 无法代你点。想完全避开弹窗就用 Firefox，
-它的 Cookie 库不加密。
+想完全避开授权弹窗就用 **Firefox**：它的 `cookies.sqlite` 在三个平台上**都是明文**，
+没有钥匙串、没有 DPAPI，差别只在 profile 目录的位置。
 
-> Safari 的 Cookie 是苹果私有格式且要「完全磁盘访问权限」，**不支持**——
+> Safari 的 Cookie 是苹果私有格式且要「完全磁盘访问权限」，**不支持**（它也只有 macOS 上有）——
 > 遇到 `--browser safari` 会直接说明原因，而不是静默失败。
 
 ### 手动提供 Cookie
@@ -272,7 +318,7 @@ bclaw BV17wpp6SEe9
 --limit-rate TEXT         全局限速，如 1M / 500K
 --overwrite               覆盖已存在文件（默认跳过）
 --keep-parts              合并后保留 .m4s 分片
---no-merge                只下载分片，不调用 ffmpeg
+--no-merge                只下载分片，不合并
 -Q, --quiet               不显示进度条
 --debug                   输出调试日志
 ```
@@ -327,7 +373,7 @@ bclaw BV17wpp6SEe9 -o ~/Videos --template "{title} [{bvid}]"
 | 3 | 网络错误、接口返回结构异常 |
 | 4 | 需要登录 / 权限不足（含大会员专享） |
 | 5 | 触发风控（HTTP 412 等） |
-| 6 | 缺少依赖（ffmpeg / ffprobe） |
+| 6 | 运行环境有问题（合并内核自检失败——这是安装包本身的问题，请重装或反馈） |
 | 7 | 磁盘或文件系统错误 |
 
 ## 断点续传
@@ -354,6 +400,12 @@ uv pip install -e ".[dev]"
 .venv/bin/python -m pytest -v
 ```
 
+打一份单文件产物（PyInstaller 不能交叉编译，每个平台各跑一次）：
+
+```bash
+bash packaging/build.sh       # → release/bclaw-<平台>.tar.gz
+```
+
 项目结构：
 
 ```
@@ -362,15 +414,19 @@ src/biliclaw/
   api.py         B站接口客户端（view / playurl / nav）
   wbi.py         WBI 签名（w_rid 计算）
   cookies.py     Cookie 加载、校验、脱敏
-  browser.py     从本机浏览器提取 Cookie（--login）
+  browser.py     从本机浏览器提取 Cookie（--login，三平台）
   models.py      接口响应数据模型
   quality.py     清晰度协商与降级判定
   downloader.py  分片并发下载与断点续传
-  muxer.py       ffmpeg 无损合并 + 合并后校验
+  mp4.py         纯 Python 的 MP4 读写内核（盒子解析 / 样本表 / 交织合并）
+  muxer.py       合并编排：MP4 走内置内核，MKV 才回退 ffmpeg
+  selftest.py    --check 用的内置合并样本
   naming.py      模板渲染与文件名净化
   progress.py    进度展示
   errors.py      错误分类与退出码
+packaging/       PyInstaller 配置、构建脚本、安装脚本
 docs/需求文档.md   需求规格说明
+docs/落地计划.md   零依赖 / 跨平台的落地计划与实测记录
 ```
 
 ## 免责声明

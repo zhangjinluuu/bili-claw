@@ -10,19 +10,37 @@
 3. **取不到要说清是哪种取不到**。没装受支持的浏览器、装了但没登录过 B站、钥匙串授权
    被拒——是三种完全不同的处境，提示也必须不同，否则用户会朝错误的方向排查。
 
-支持范围：macOS 上的 Chromium 系（Chrome / Edge / Brave / Chromium / Vivaldi）与
-Firefox。Safari 的 Cookie 是私有二进制格式且需要「完全磁盘访问权限」，不做支持，
-但会给出明确提示而不是静默失败。
+## 各平台支持矩阵
+
+| | Chromium 系（Chrome / Edge / Brave / Chromium / Vivaldi） | Firefox |
+|---|---|---|
+| macOS | ✅ 钥匙串口令 → PBKDF2(1003) → AES-128-CBC | ✅ 明文 |
+| Linux | ✅ gnome-keyring 口令，没接上就用 `peanuts` → PBKDF2(1) | ✅ 明文 |
+| Windows | ⚠️ **仅 `v10`**：Local State 的 DPAPI 密钥 → AES-256-GCM | ✅ 明文 |
+
+**Windows 上 Chrome 127+ 的 `v20`（App-Bound Encryption）明确不支持。** 那套方案把
+密钥交给一个受保护的系统服务，正规解法只有「从 Chrome 进程里读内存」这类做法——既不
+稳定，也和恶意软件的手法没有区别，本工具不做。遇到时给明确提示，并指向 Firefox 与
+`--cookie-file` 两条出路。
+
+**Firefox 是三个平台上投入产出比最高的一条路**：它的 `cookies.sqlite` **三平台都是明文**，
+没有加密、没有钥匙串、没有 DPAPI，差别只在 profile 目录的位置。
+
+Safari 的 Cookie 是私有二进制格式且需要「完全磁盘访问权限」，不做支持，但会给出明确
+提示而不是静默失败。
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -38,12 +56,29 @@ DOMAIN_SUFFIXES = ("bilibili.com", "bilibili.cn")
 
 #: Chromium 的 AES 参数。三个值都硬编码在 Chromium 源码里，不是可配置项。
 _SALT = b"saltysalt"
-_ITERATIONS = 1003
+_ITERATIONS = 1003  # macOS 的迭代次数
 _KEY_LENGTH = 16  # AES-128
 _IV = b" " * 16  # 16 个空格
 
+#: Linux 的迭代次数是 **1**，不是 macOS 的 1003。同一个 PBKDF2、同一个 salt，
+#: 只有这个数字不同——照抄 macOS 的 1003 会解出一堆乱码而不是报错。
+_LINUX_ITERATIONS = 1
+
+#: Chromium 在 Linux 上没接上钥匙串时用的固定口令，硬编码在源码里。
+_LINUX_FALLBACK_PASSWORD = b"peanuts"
+
 #: Chrome 130 起在明文前面拼了一段 SHA256(host_key)，把 Cookie 绑到域名上。
 _DOMAIN_HASH_LENGTH = 32
+
+#: Windows 的 AES-256-GCM：12 字节 nonce + 密文 + 16 字节 tag。
+_GCM_NONCE_LENGTH = 12
+_GCM_TAG_LENGTH = 16
+
+#: Windows 上被 DPAPI 包起来的密钥带这个前缀。
+_DPAPI_PREFIX = b"DPAPI"
+
+#: Chrome 127+ 的 App-Bound 加密前缀。明确不支持（见模块自述）。
+_APP_BOUND_PREFIX = b"v20"
 
 #: 1601-01-01 到 1970-01-01 的秒数。Chromium 的时间戳以 1601 为起点、单位为微秒。
 _CHROME_EPOCH_OFFSET = 11_644_473_600
@@ -107,37 +142,128 @@ class _ChromiumFamily:
     keychain_account: str
 
 
-def _browser_support() -> Path:
-    return Path.home() / "Library" / "Application Support"
+@dataclass(frozen=True, slots=True)
+class _Vendor:
+    """一个 Chromium 系浏览器在三个平台上的位置。
+
+    写成一张表而不是三串 if，是因为「哪个平台放在哪」正是这里唯一要回答的问题，
+    摊平了才看得清三者其实**互不相同**：macOS 是 `Google/Chrome`，Windows 还要多
+    一层 `User Data`，Linux 则是 `~/.config` 下的扁平名字。照着 macOS 的样子去猜
+    Windows 的路径，会得到「找不到 profile」——而那个提示会把人引去重新登录。
+    """
+
+    key: str
+    label: str
+    darwin: str
+    win32: str
+    linux: str
+    keychain_service: str
+    keychain_account: str
+    #: gnome-keyring 里那条记录的 application 属性
+    keyring: str
+
+
+_VENDORS = (
+    _Vendor(
+        "chrome", "Google Chrome",
+        "Google/Chrome", "Google/Chrome/User Data", "google-chrome",
+        "Chrome Safe Storage", "Chrome", "chrome",
+    ),
+    _Vendor(
+        "edge", "Microsoft Edge",
+        "Microsoft Edge", "Microsoft/Edge/User Data", "microsoft-edge",
+        "Microsoft Edge Safe Storage", "Microsoft Edge", "microsoft-edge",
+    ),
+    _Vendor(
+        "brave", "Brave",
+        "BraveSoftware/Brave-Browser", "BraveSoftware/Brave-Browser/User Data", "BraveSoftware/Brave-Browser",
+        "Brave Safe Storage", "Brave", "brave",
+    ),
+    _Vendor(
+        "chromium", "Chromium",
+        "Chromium", "Chromium/User Data", "chromium",
+        "Chromium Safe Storage", "Chromium", "chromium",
+    ),
+    _Vendor(
+        "vivaldi", "Vivaldi",
+        "Vivaldi", "Vivaldi/User Data", "vivaldi",
+        "Vivaldi Safe Storage", "Vivaldi", "vivaldi",
+    ),
+)
+
+
+def _platform() -> str:
+    """归一成 ``darwin`` / ``win32`` / ``linux`` 三者之一。
+
+    其余一切都按这三档分派，所以「这个平台算什么」只能有一个答案——散落的
+    `sys.platform == ...` 判断迟早会出现两种口径，而那种 bug 只在别人的机器上复现。
+    """
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform == "win32":
+        return "win32"
+    return "linux"
+
+
+def _chromium_base() -> Path:
+    """Chromium 系 profile 的基准目录（各浏览器的相对路径见 `_VENDORS`）。"""
+    platform = _platform()
+    if platform == "darwin":
+        return Path.home() / "Library" / "Application Support"
+    if platform == "win32":
+        # 环境变量缺失时退回约定位置，而不是直接用 ~ —— 在 Windows 上
+        # 真正的 profile 从不放在用户主目录里，猜错等于静默什么都找不到。
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 
 
 def _chromium_families() -> list[_ChromiumFamily]:
-    base = _browser_support()
+    base = _chromium_base()
+    platform = _platform()
     return [
         _ChromiumFamily(
-            "chrome", "Google Chrome", base / "Google" / "Chrome", "Chrome Safe Storage", "Chrome"
-        ),
-        _ChromiumFamily(
-            "edge", "Microsoft Edge", base / "Microsoft Edge", "Microsoft Edge Safe Storage", "Microsoft Edge"
-        ),
-        _ChromiumFamily(
-            "brave", "Brave", base / "BraveSoftware" / "Brave-Browser", "Brave Safe Storage", "Brave"
-        ),
-        _ChromiumFamily("chromium", "Chromium", base / "Chromium", "Chromium Safe Storage", "Chromium"),
-        _ChromiumFamily("vivaldi", "Vivaldi", base / "Vivaldi", "Vivaldi Safe Storage", "Vivaldi"),
+            vendor.key,
+            vendor.label,
+            base / getattr(vendor, platform),
+            vendor.keychain_service,
+            vendor.keychain_account,
+        )
+        for vendor in _VENDORS
     ]
 
 
+def _keyring_application(family: _ChromiumFamily) -> str:
+    """Linux 的 gnome-keyring 用 application 属性区分浏览器。"""
+    for vendor in _VENDORS:
+        if vendor.key == family.key:
+            return vendor.keyring
+    return family.key
+
+
+def _firefox_roots() -> list[Path]:
+    """Firefox 的 profile 目录。三个平台又各不相同，Linux 还不止一处。"""
+    platform = _platform()
+    if platform == "darwin":
+        return [Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"]
+    if platform == "win32":
+        # Firefox 在 Windows 上用的是 Roaming，不是 Local
+        appdata = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return [Path(appdata) / "Mozilla" / "Firefox" / "Profiles"]
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "mozilla" / "firefox"
+    # 原生安装把 profile 直接放在 firefox/ 下；部分发行版与 Flatpak 会再包一层 Profiles/
+    return [base, base / "Profiles"]
+
+
 def _firefox_profiles() -> list[tuple[str, Path]]:
-    root = _browser_support() / "Firefox" / "Profiles"
-    if not root.is_dir():
-        return []
-    found: list[tuple[str, Path]] = []
-    for entry in sorted(root.iterdir()):
-        database = entry / "cookies.sqlite"
-        if database.is_file():
-            found.append((entry.name, database))
-    return found
+    found: dict[str, Path] = {}
+    for root in _firefox_roots():
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            database = entry / "cookies.sqlite"
+            if database.is_file():
+                found.setdefault(entry.name, database)
+    return sorted(found.items())
 
 
 def is_bilibili(host: str) -> bool:
@@ -210,7 +336,110 @@ def _keychain_secret(service: str, account: str) -> bytes:
     return result.stdout.strip().encode()
 
 
-def _decrypt(key: bytes, blob: bytes) -> bytes:
+def _keyring_secret(application: str) -> bytes | None:
+    """Linux：从 gnome-keyring 里取口令；没装、或没这条记录时返回 None。
+
+    走 `secret-tool` 这个命令行前端而不是直接调 D-Bus：少一个依赖，而且用户自己也能
+    用同一条命令验证「钥匙串里到底有没有这条记录」——排查的时候这一点很值钱。
+    """
+    if shutil.which("secret-tool") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "application", application],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("secret-tool 调用失败：%s", exc)
+        return None
+    password = result.stdout.strip()
+    if result.returncode != 0 or not password:
+        return None
+    return password.encode()
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes:
+    """Windows：调 `CryptUnprotectData`。用 ctypes 直接调，不引入新依赖。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buffer = ctypes.create_string_buffer(blob, len(blob))
+    incoming = _DataBlob(len(blob), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    outgoing = _DataBlob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(incoming), None, None, None, None, 0, ctypes.byref(outgoing)
+    ):
+        raise BiliError(
+            "DPAPI 解不开 Local State 里的密钥",
+            hint="这份配置多半是另一个 Windows 账户建的，当前用户解不开；请换 --browser，或用 --cookie-file 手工提供",
+        )
+    try:
+        return ctypes.string_at(outgoing.pbData, outgoing.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(outgoing.pbData)
+
+
+def _windows_key(root: Path) -> bytes:
+    """Windows：取出被 DPAPI 保护的 AES-256 密钥。
+
+    Windows 的方案与 macOS/Linux **不是一回事**：不派生口令，而是在 `Local State` 里
+    放一个 32 字节随机密钥，外面套一层 DPAPI——只有同一个 Windows 用户解得开。所以
+    这里既没有 PBKDF2，也不该照抄 macOS 的参数。
+    """
+    state = root / "Local State"
+    try:
+        payload = json.loads(state.read_text(encoding="utf-8"))
+        blob = base64.b64decode(payload["os_crypt"]["encrypted_key"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise BiliError(
+            f"没能从 {state} 读到 os_crypt.encrypted_key",
+            hint="确认这个浏览器至少启动过一次；也可以换 --browser，或用 --cookie-file 手工提供",
+        ) from exc
+    if not blob.startswith(_DPAPI_PREFIX):
+        raise BiliError(
+            "Local State 里的密钥没有 DPAPI 前缀，格式与预期不符",
+            hint="多半是这个 Chromium 版本换了方案；请换 --browser，或用 --cookie-file 手工提供",
+        )
+    return _dpapi_unprotect(blob[len(_DPAPI_PREFIX) :])
+
+
+def _chromium_key(family: _ChromiumFamily) -> bytes:
+    """本平台上这个浏览器解密 Cookie 用的密钥。
+
+    三个平台的方案**互不相同**，不是同一个东西换个名字：
+
+    - **macOS**：钥匙串口令 → ``PBKDF2(saltysalt, 1003)`` → 16 字节 AES-128 密钥
+    - **Linux**：钥匙串口令（没接上就用 ``peanuts``）→ ``PBKDF2(saltysalt, 1)``
+    - **Windows**：``Local State`` 里被 DPAPI 保护的 32 字节 AES-256 密钥
+
+    中间那个迭代次数是最容易抄错的地方：Linux 是 **1**，照抄 macOS 的 1003 不会
+    报错，只会解出一堆乱码。
+    """
+    platform = _platform()
+    if platform == "darwin":
+        password = _keychain_secret(family.keychain_service, family.keychain_account)
+        return hashlib.pbkdf2_hmac("sha1", password, _SALT, _ITERATIONS, _KEY_LENGTH)
+    if platform == "win32":
+        return _windows_key(family.root)
+    password = _keyring_secret(_keyring_application(family)) or _LINUX_FALLBACK_PASSWORD
+    return hashlib.pbkdf2_hmac("sha1", password, _SALT, _LINUX_ITERATIONS, _KEY_LENGTH)
+
+
+def _cryptography():
+    """惰性导入 cryptography 的密码学原语。
+
+    放在函数里而不是模块顶层：只用下载功能的人不该为 `--login` 付这份导入开销，
+    而且没装 cryptography 时也只有这条路径会给出「照做就能好」的提示。
+
+    （返回的是 `(Cipher, algorithms, modes)` 三个模块属性；这里不写返回注解，
+    因为要写全得先把 cryptography 的类型搬进来，反而绕远了。）
+    """
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     except ImportError as exc:  # pragma: no cover - 依赖缺失时的兜底
@@ -218,17 +447,59 @@ def _decrypt(key: bytes, blob: bytes) -> bytes:
             "解密 Chromium 系的 Cookie 需要 cryptography",
             hint="pip install cryptography，或重装：uv tool install --force bili-claw",
         ) from exc
+    return Cipher, algorithms, modes
+
+
+def _decrypt(key: bytes, blob: bytes) -> bytes:
+    """macOS / Linux：AES-128-CBC，IV 是 16 个空格。"""
+    Cipher, algorithms, modes = _cryptography()
     decryptor = Cipher(algorithms.AES(key), modes.CBC(_IV)).decryptor()
     return decryptor.update(blob) + decryptor.finalize()
 
 
+def _decrypt_gcm(key: bytes, blob: bytes) -> bytes | None:
+    """Windows：AES-256-GCM。12 字节 nonce 在前，16 字节 tag 在后，没有填充可剥。
+
+    解不开（tag 校验不过）时返回 None 而不是抛异常：一条 Cookie 解不出来不该让整次
+    提取失败，它多半只是属于另一个 Windows 账户。
+    """
+    from cryptography.exceptions import InvalidTag
+
+    Cipher, algorithms, modes = _cryptography()
+    if len(blob) <= _GCM_NONCE_LENGTH + _GCM_TAG_LENGTH:
+        return None
+    nonce = blob[:_GCM_NONCE_LENGTH]
+    payload = blob[_GCM_NONCE_LENGTH : -_GCM_TAG_LENGTH]
+    tag = blob[-_GCM_TAG_LENGTH:]
+    try:
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+    except ValueError as exc:  # pragma: no cover - 密钥长度不对才会走到
+        log.debug("GCM 参数不合法：%s", exc)
+        return None
+    try:
+        return decryptor.update(payload) + decryptor.finalize()
+    except InvalidTag:
+        return None
+
+
+def _strip_domain_hash(raw: bytes, host: str) -> bytes:
+    """Chrome 130 起在明文前拼了 32 字节 ``SHA256(host_key)``，要剥掉。
+
+    对不上不算错误：那要么是更早的 Chrome 写的（根本没有这段前缀），要么 host 与
+    写入时不同。两种情况都该原样返回。
+    """
+    digest = hashlib.sha256(host.encode()).digest()
+    if len(raw) >= _DOMAIN_HASH_LENGTH and raw[:_DOMAIN_HASH_LENGTH] == digest:
+        return raw[_DOMAIN_HASH_LENGTH:]
+    return raw
+
+
 def decrypt_value(blob: bytes, key: bytes, host: str) -> str | None:
-    """把 Chromium 的 `encrypted_value` 还原成明文；认不出来时返回 None。"""
+    """macOS / Linux：把 `encrypted_value` 还原成明文；认不出来时返回 None。"""
     if not blob:
         return None
     prefix, payload = blob[:3], blob[3:]
     if prefix not in (b"v10", b"v11"):
-        # v20 是 Windows 的 App-Bound 加密，macOS 上不该出现
         log.debug("跳过不认识的前缀 %r（host=%s）", prefix, host)
         return None
     raw = _decrypt(key, payload)
@@ -236,9 +507,17 @@ def decrypt_value(blob: bytes, key: bytes, host: str) -> str | None:
         padding = raw[-1]
         if 0 < padding <= 16:
             raw = raw[:-padding]
-    if len(raw) >= _DOMAIN_HASH_LENGTH and raw[:_DOMAIN_HASH_LENGTH] == hashlib.sha256(host.encode()).digest():
-        raw = raw[_DOMAIN_HASH_LENGTH:]
-    return raw.decode("utf-8", "replace")
+    return _strip_domain_hash(raw, host).decode("utf-8", "replace")
+
+
+def decrypt_value_gcm(blob: bytes, key: bytes, host: str) -> str | None:
+    """Windows：同样的 `v10` 前缀，但里面是 AES-256-GCM（Windows 从 Chrome 80 起）。"""
+    if not blob or blob[:3] != b"v10":
+        return None
+    raw = _decrypt_gcm(key, blob[3:])
+    if raw is None:
+        return None
+    return _strip_domain_hash(raw, host).decode("utf-8", "replace")
 
 
 def chrome_time_to_unix(value: int | None) -> int:
@@ -258,13 +537,22 @@ def _pick_database(root: Path) -> Path | None:
     return max(existing, key=lambda path: path.stat().st_mtime)
 
 
+class _AppBound(Exception):
+    """这个 Chromium 的 Cookie 用了 App-Bound 加密，本程序解不开。
+
+    单独一个异常类型，是为了让 `extract` 能说清「它登录过，只是我们解不开」——
+    这两种处境给用户的指令完全相反：一个叫他去登录（白费功夫），一个叫他换浏览器。
+    """
+
+
 def _read_chromium(family: _ChromiumFamily) -> Extraction | None:
     database = _pick_database(family.root)
     if database is None:
         return None
-    key = hashlib.pbkdf2_hmac("sha1", _keychain_secret(family.keychain_service, family.keychain_account),
-                              _SALT, _ITERATIONS, _KEY_LENGTH)
+    key = _chromium_key(family)
+    decrypt = decrypt_value_gcm if _platform() == "win32" else decrypt_value
     cookies: list[Cookie] = []
+    app_bound = False
     with _opened(database) as connection:
         rows = connection.execute(
             "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure FROM cookies"
@@ -272,7 +560,12 @@ def _read_chromium(family: _ChromiumFamily) -> Extraction | None:
     for host, name, plain, blob, path, expires, secure in rows:
         if not is_bilibili(host):
             continue
-        value = plain or decrypt_value(blob, key, host)
+        if blob[:3] == _APP_BOUND_PREFIX:
+            # Chrome 127+ 在 Windows 上把密钥又套了一层，只有它自己的进程拿得到。
+            # 记一笔，等确认一条都没解出来时再据此给出准确的提示。
+            app_bound = True
+            continue
+        value = plain or decrypt(blob, key, host)
         if not value:
             continue
         cookies.append(
@@ -286,6 +579,8 @@ def _read_chromium(family: _ChromiumFamily) -> Extraction | None:
             )
         )
     if not cookies:
+        if app_bound:
+            raise _AppBound
         return None
     return Extraction(family.label, database.parent.name, dedupe(cookies))
 
@@ -317,10 +612,15 @@ def _read_firefox(name: str, database: Path) -> Extraction | None:
 #: `--browser` 接受的名字。`auto` 按下面的顺序依次尝试。
 BROWSERS = ("auto", "chrome", "edge", "brave", "chromium", "vivaldi", "firefox", "safari")
 
-_SAFARI_HINT = (
-    "Safari 的 Cookie 是私有二进制格式，而且要先在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」"
-    "里授权终端，所以没做支持；请改用 Chrome 或 Firefox，或用 --cookie-file 手工提供"
-)
+
+def _safari_hint() -> str:
+    """Safari 提示。非 macOS 上要说得直白些，免得让人以为自己少装了什么。"""
+    if _platform() != "darwin":
+        return "Safari 只有 macOS 上才有；本平台请改用 Firefox，或用 --cookie-file 手工提供"
+    return (
+        "Safari 的 Cookie 是私有二进制格式，而且要先在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」"
+        "里授权终端，所以没做支持；请改用 Chrome 或 Firefox，或用 --cookie-file 手工提供"
+    )
 
 
 def _installed_chromium() -> list[_ChromiumFamily]:
@@ -337,7 +637,7 @@ def extract(browser: str = "auto", *, profile: str | None = None) -> Extraction:
     固定顺序至少是可预测的，真取错了 ``--browser`` 一指定就能绕开。
     """
     if browser == "safari":
-        raise UsageError("暂不支持从 Safari 读取 Cookie", hint=_SAFARI_HINT)
+        raise UsageError("暂不支持从 Safari 读取 Cookie", hint=_safari_hint())
     if browser not in BROWSERS:
         raise UsageError(f"不认识的浏览器：{browser}", hint=f"可选：{'、'.join(BROWSERS)}")
 
@@ -360,7 +660,12 @@ def extract(browser: str = "auto", *, profile: str | None = None) -> Extraction:
     for family in families:
         if browser not in ("auto", family.key):
             continue
-        if (found := _read_chromium(family)) is not None:
+        try:
+            found = _read_chromium(family)
+        except _AppBound:
+            attempts.append(f"{family.label}：Cookie 用了 App-Bound 加密，本程序解不开（它是登录过的）")
+            continue
+        if found is not None:
             return found
         attempts.append(f"{family.label}：装了，但库里没有 B站的 Cookie")
 
