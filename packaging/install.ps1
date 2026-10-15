@@ -3,10 +3,14 @@
     BiliClaw 一键安装（Windows）。
 
 .EXAMPLE
-    irm https://github.com/zhangjinluuu/bili-claw/releases/latest/download/install.ps1 | iex
+    irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.ps1 | iex
+
+    URL 里写死 tag 而不是用 /releases/latest：latest 那条重定向会跳过预发布，
+    而验证期发的正是预发布，写 latest 会让用户的第一条命令直接 404，连脚本都拿不到。
+    版本转正后换成 /releases/latest/download/install.ps1 即可。
 
     因为整条命令是一行，参数只能靠环境变量传：
-        $env:BCLAW_VERSION = "0.1.0"          # 装指定版本（默认装最新）
+        $env:BCLAW_VERSION = "0.1.0"          # 装指定版本（默认装最新，含预发布）
         $env:BCLAW_INSTALL_DIR = "$HOME\bin"  # 装到别处
 
 .NOTES

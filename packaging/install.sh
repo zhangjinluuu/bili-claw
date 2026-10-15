@@ -2,15 +2,20 @@
 #
 # BiliClaw 一键安装（macOS / Linux）。
 #
-#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.sh | sh
+#
+# **URL 里为什么写死 tag 而不是 /releases/latest？** 因为 latest 那条重定向会跳过
+# 预发布，而验证期发的正是预发布——写 latest 的话，用户敲下第一条命令就吃 404，
+# 连脚本都下载不到，脚本内部那套「先问 API 拿 tag」的兜底根本没机会运行。
+# 版本转正之后，把 URL 换成 /releases/latest/download/install.sh 即可。
 #
 # 可选环境变量：
-#   BCLAW_VERSION=0.1.0          装指定版本（默认装最新）
+#   BCLAW_VERSION=0.1.0          装指定版本（默认装最新，含预发布）
 #   BCLAW_INSTALL_DIR=~/.local/bin   安装到别处
 #
 # **为什么坚持用 curl 而不是让用户去浏览器下载？**
 # 这不是风格偏好。浏览器下载的文件会被打上隔离标记（macOS 的 com.apple.quarantine），
-# 双击/首次执行时直接报「已损坏，无法打开」，而 ENABLE 它的正规办法是买一个
+# 双击/首次执行时直接报「已损坏，无法打开」，而消除它的正规办法是买一个
 # Apple 开发者账号做签名与公证（$99/年）。命令行工具下载**不产生这个标记**，
 # 于是整个问题被绕开了——这是本脚本存在的核心理由，不是顺手的方便。
 
