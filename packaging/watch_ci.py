@@ -31,7 +31,8 @@ def get(path: str) -> tuple[int, dict | list | None]:
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, None
-    except Exception as error:  # 网络抖动不该让这个脚本死掉
+    except (OSError, ValueError) as error:
+        # 网络抖动或响应不是 JSON——两种情况都不该让这个脚本死掉，它只是来读状态的。
         print(f"  （请求失败：{error}）", flush=True)
         return 0, None
 
@@ -56,14 +57,17 @@ def wait_for_quota() -> None:
         time.sleep(wait)
 
 
-def latest_tag_run() -> dict | None:
-    status, payload = get("/actions/runs?event=push&per_page=10")
+def tag_runs(limit: int = 3) -> list[dict]:
+    """最近几次 tag 触发的 run，新的在前。
+
+    刻意取多次而不是只取最新的一次：修复前那次 run 的 annotation 正是"CRLF 假设"
+    的独立佐证，修复后那次才是结论。两个都看到，才算真的说清楚。
+    """
+    status, payload = get("/actions/runs?event=push&per_page=20")
     if status != 200 or not isinstance(payload, dict):
-        return None
-    for run in payload.get("workflow_runs", []):
-        if run.get("head_branch", "").startswith("v"):
-            return run
-    return None
+        return []
+    runs = [r for r in payload.get("workflow_runs", []) if r.get("head_branch", "").startswith("v")]
+    return runs[:limit]
 
 
 def report(run: dict) -> None:
@@ -98,12 +102,13 @@ def main() -> int:
     once = "--once" in sys.argv
     while True:
         wait_for_quota()
-        run = latest_tag_run()
-        if run is None:
+        runs = tag_runs()
+        if not runs:
             print("  还没有 tag 触发的 run，等 60 秒", flush=True)
         else:
-            report(run)
-            if run["status"] == "completed" or once:
+            for run in runs:
+                report(run)
+            if once or all(run["status"] == "completed" for run in runs):
                 return 0
         if once:
             return 1
