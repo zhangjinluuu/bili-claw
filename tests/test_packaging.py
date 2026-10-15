@@ -13,6 +13,7 @@ ubuntu-latest"这类反面教材，不剥的话每一条断言都会被自己的
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -212,3 +213,115 @@ def test_annotation_tail_escapes_workflow_commands_correctly(tmp_path: Path) -> 
     assert "100%25 done" in out, "真正的 `%` 必须转义成 `%25`，否则 annotation 会被截断"
     assert "'" not in out, "参数展开里的引号是字面量，% 会变成 '%25'"
     assert "%0A" in out, "换行必须编码成 %0A，否则 annotation 只有第一行"
+
+
+#: 一整行里 `#` 之前的部分，用来把行尾注释也剔掉。
+_CODE_BEFORE_COMMENT = re.compile(r"^[^#]*")
+#: `printf '<格式串>'` 里的格式串。
+_PRINTF_FORMAT = re.compile(r"printf\s+'((?:[^'\\]|\\.)*)'")
+#: 三引号块（模块 docstring 之类）。它只是字符串字面量，永远不会被打印。
+_DOCSTRING = re.compile(r'""".*?"""', re.DOTALL)
+#: printf 里真正吃参数的转换说明，例如 `%s` / `%0A` / `%-20s`。`%%` 不算。
+_CONVERSION = re.compile(r"%(?!%)[-+ #0']*\d*(?:\.\d+)?[a-zA-Z]")
+
+
+def _without_comments(text: str) -> str:
+    """整行注释**与行尾注释**都剔掉。
+
+    行尾注释也得剔：`from biliclaw import __version__  # noqa: E402 - 中文说明` 这种
+    写法在 spec 里就有，只剔整行会把中文说明留下来，断言当场就红。
+
+    不处理"`#` 出现在字符串字面量里"的情形——这里只用来**减少**检查范围，剔多了
+    顶多少查一点，不会误报。
+    """
+    return "\n".join(_CODE_BEFORE_COMMENT.match(line).group(0) for line in text.splitlines())
+
+
+def _without_comments_or_docstrings(text: str) -> str:
+    """再去掉三引号块。
+
+    spec 顶部的模块 docstring 是整篇中文说明——它只是字符串字面量，永远不会被打印
+    到 stdout，留在检查范围里只会逼着人把注释写成英文（第一版就是这么误报的）。
+    去掉之后，剩下的才是真正会被执行、可能产生输出的代码。
+    """
+    return _without_comments(_DOCSTRING.sub("", text))
+
+
+def test_spec_source_is_pure_ascii_outside_comments() -> None:
+    """`bclaw.spec` 里会被执行的代码必须是纯 ASCII。
+
+    **这就是 Windows 构建失败的真正原因**，而且它伪装得极好。spec 是被 PyInstaller
+    在自己的进程里 exec 的，那个进程在 Windows 上的 stdout 编码是 cp1252。spec 末尾
+    原本写着：
+
+        print(f"BiliClaw {__version__} → {exe.name}")
+
+    `→`（U+2192）在 cp1252 里没有对应字符，于是抛：
+
+        File "packaging/bclaw.spec", line 98, in <module>
+          print(f"BiliClaw {__version__} → {exe.name}")
+        UnicodeEncodeError: 'charmap' codec can't encode character '\\u2192'
+        in position 15: character maps to <undefined>
+
+    要命的是位置：它发生在**构建已经成功之后**。PYZ 与 PKG 都已建好，PyInstaller 的
+    日志正好停在 `checking EXE` 那一行，于是现场看起来像 EXE 阶段崩了——而
+    `EXE.assemble()` 其实压根没开始。五个平台里只有 Windows 挂，因为只有它的控制台
+    代码页不是 UTF-8。查了好几轮才落到这一行上。
+
+    `build.sh` 里那些 `::notice::` / `::error::` 标记同为 ASCII，理由是同一个。
+    """
+    spec = (PACKAGING / "bclaw.spec").read_text(encoding="utf-8")
+    offenders = [
+        f"bclaw.spec:{lineno}: {line.strip()}"
+        for lineno, line in enumerate(_without_comments_or_docstrings(spec).splitlines(), 1)
+        if line.strip() and not line.isascii()
+    ]
+    assert not offenders, (
+        "spec 会被执行的代码里有非 ASCII 字符——Windows 上 stdout 是 cp1252，"
+        "打印它会抛 UnicodeEncodeError，而且现场看起来像是别的地方崩了：\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_printf_format_strings_never_swallow_their_argument() -> None:
+    """`printf` 的格式串必须能吃下自己的参数。
+
+    真正的写法是 `printf '::error::build log:%%0A%s\\n' "$text"`。少写一个 `%` 时，
+    `%0A` **不是"换行的转义"**，而是 printf 自己的格式说明符——`%A` 是十六进制浮点，
+    前面的 `0` 是补零标志。于是 `$text` 被当成浮点数解析掉了，annotation 里只剩下：
+
+        build log:0X0P+0
+
+    本该是最有用的一条注解，结果比没有还糟：连"日志没取到"这个信息都没给出来。
+    本地演示：
+
+        $ printf 'A) %0A%s\\n' "正文"
+        A) 0X0P+0
+        bash: printf: 正文: invalid number
+
+    只检查**含转换说明**的格式串：`printf '\\n把它加进 PATH：\\n'` 这种纯字面量输出
+    本来就不吃参数，要求它"保住 sentinel"是测试自己搞错了。
+
+    这条用**真的 bash 跑一遍**而不是查字符串，因为要判的正是 printf 的解析行为。
+    """
+    checked = 0
+    for path in [WORKFLOW, *_shell_scripts()]:
+        text = _strip_comments(path.read_text(encoding="utf-8"))
+        for fmt in _PRINTF_FORMAT.findall(text):
+            if not _CONVERSION.search(fmt):
+                continue  # 纯字面量，无参数可吃
+            sentinel = "SENTINEL-argument-survived"
+            result = subprocess.run(
+                ["bash", "-c", f"printf {shlex.quote(fmt)} {shlex.quote(sentinel)}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            checked += 1
+            assert sentinel in result.stdout, (
+                f"{path.name}: printf 格式串把参数吃掉了：{fmt!r}\n"
+                f"  输出：{result.stdout!r}\n"
+                f"  stderr：{result.stderr.strip()}"
+            )
+
+    assert checked >= 5, f"只检查到 {checked} 个带参数的 printf 格式串——正则可能失效了"

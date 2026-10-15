@@ -95,4 +95,15 @@ exe = EXE(  # noqa: F821
     entitlements_file=None,
 )
 
-print(f"BiliClaw {__version__} → {exe.name}")
+# 这一行必须是**纯 ASCII**。spec 是被 PyInstaller 在自己的进程里 exec 的，而 Windows
+# 上那个进程的 stdout 编码是 cp1252——原先这里写的是 "→"（U+2192），编不出来就抛：
+#
+#     UnicodeEncodeError: 'charmap' codec can't encode character '\u2192'
+#     in position 15: character maps to <undefined>
+#
+# 要命的是它发生在**构建已经成功之后**：PYZ 与 PKG 都已建好、PyInstaller 的日志正好
+# 停在 `checking EXE` 那一行，于是现场看起来像 EXE 阶段崩了。五个平台里只有 Windows
+# 挂，因为只有它的控制台代码页不是 UTF-8。查错时请直接看这一行。
+#
+# build.sh 里那些 ::notice:: / ::error:: 标记同为 ASCII，理由是同一个。
+print(f"BiliClaw {__version__} -> {exe.name}")

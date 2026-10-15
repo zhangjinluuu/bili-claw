@@ -80,7 +80,12 @@ jobs:
           fi
           text="$(printf '%s' "$text" | tr -d '\r')"
           text="${text//'%'/'%25'}"
-          printf '::error::build log:%0A%s\n' "${text//$'\n'/'%0A'}"
+          # 格式串里的换行**必须写成 `%%0A`**：`%0A` 不是转义，而是 printf 自己的
+          # 格式说明符（`%A` = 十六进制浮点，`0` 是补零标志）。写成 `%0A` 时它会
+          # 吃掉第一个参数当浮点数，annotation 里只剩 `build log:0X0P+0`——本该最
+          # 有用的一条注解，结果比没有还糟。参数里的 `%0A` 不受影响，所以换行替换
+          # 照旧走 `%0A`。
+          printf '::error::build log:%%0A%s\n' "${text//$'\n'/'%0A'}"
 
       - uses: actions/upload-artifact@v4
         with:
