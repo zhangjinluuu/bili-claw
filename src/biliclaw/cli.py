@@ -994,10 +994,28 @@ def cli(
     quiet: bool = typer.Option(False, "-Q", "--quiet", help="不显示进度条"),
     debug: bool = typer.Option(False, "--debug", help="输出调试日志（会自动脱敏 Cookie）"),
     version: bool = typer.Option(False, "--version", help="显示版本后退出"),
+    selftest: bool = typer.Option(
+        False,
+        "--selftest",
+        hidden=True,
+        help="只跑内置合并自检，以其结果作为退出码（构建脚本冒烟测试用）",
+    ),
 ) -> None:
     if version:
         typer.echo(f"bili-claw {__version__}（哔哩娃娃机 / BiliClaw）")
         raise typer.Exit()
+
+    if selftest:
+        # **输出刻意全是 ASCII。** 这条路径是给构建脚本判读的，而 Windows 控制台的
+        # 默认代码页不是 UTF-8：中文提示在那边会变成乱码，于是脚本里的
+        # `grep "自检通过"` 永远不匹配，构建就"失败"在一个根本没有坏的地方
+        # ——Windows CI 上真踩过一次，排查成本远高于写这四行。
+        failure = check_merge()
+        if failure is None:
+            typer.echo("merge self-check: OK")
+            raise typer.Exit()
+        typer.echo(f"merge self-check: FAILED: {failure}", err=True)
+        raise typer.Exit(int(ExitCode.MISSING_DEPENDENCY))
 
     if not url and not check and not login:
         err_console.print("[red]请提供视频链接，或使用 --check / --login[/red]")

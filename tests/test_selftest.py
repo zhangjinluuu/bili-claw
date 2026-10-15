@@ -93,3 +93,43 @@ def test_payload_digest_is_pinned_to_the_samples() -> None:
 def test_payload_of_rejects_truncated_input(blob: bytes) -> None:
     """顶层盒子走不完时必须认输，不能把半截数据当成有效载荷。"""
     assert selftest._payload_of(blob) is None
+
+
+# --- --selftest 这个命令行开关 ------------------------------------------------
+# 它存在的唯一理由是给构建脚本判读，所以这里断言的是「构建脚本能怎么读它」。
+
+
+def test_selftest_flag_prints_ascii_and_exits_zero() -> None:
+    """``--selftest`` 的输出必须**全是 ASCII**，且以退出码给结论。
+
+    Windows CI 上真的栽过一次：构建脚本原本跑 ``--check`` 再 ``grep "自检通过"``，
+    而 Windows 控制台的默认代码页不是 UTF-8，那几个汉字输出后 grep 永远不匹配，
+    于是整个 job 失败——失败点看起来还像"合并内核坏了"，排查方向完全是错的。
+
+    退出码是三个平台判读方式唯一一致的信号；ASCII 是让它连输出都不用读。
+    """
+    import typer.testing
+
+    from biliclaw.cli import app
+
+    result = typer.testing.CliRunner().invoke(app, ["--selftest"])
+    assert result.exit_code == 0
+    assert result.stdout.strip().isascii()
+    assert "OK" in result.stdout
+
+
+def test_selftest_flag_exits_6_when_the_kernel_is_broken(monkeypatch) -> None:
+    """合并内核坏了时，构建脚本必须能靠退出码发现——这是它在 CI 里的全部意义。"""
+    import typer.testing
+
+    from biliclaw import mp4
+    from biliclaw.cli import app
+
+    def broken(**kwargs):
+        kwargs["dest"].write_bytes(b"\x00" * 64)
+        return kwargs["dest"]
+
+    monkeypatch.setattr(mp4, "merge", broken)
+    result = typer.testing.CliRunner().invoke(app, ["--selftest"])
+    assert result.exit_code == 6  # ExitCode.MISSING_DEPENDENCY：安装包本身的问题
+

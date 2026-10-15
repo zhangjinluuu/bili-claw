@@ -3,7 +3,10 @@
 # 构建 BiliClaw 的单文件产物并打成发布归档。
 #
 #   packaging/build.sh          # 构建 + 冒烟 + 归档
-#   packaging/build.sh --check  # 只构建，不归档（本地调试用）
+#   packaging/build.sh --no-archive   # 只构建，不归档（本地调试用）
+#
+# 这个开关**刻意不叫 --check**：`bclaw --check` 是检查运行环境，两回事，同名会让人
+# 以为这里在跑环境检查。（tests/test_packaging.py 会挡住重名。）
 #
 # CI（.github/workflows/release.yml）与本地走的是**同一条路径**——只有本地跑得通，
 # CI 才可能跑得通；两边各写一套的结果一定是「CI 绿了但发出来的东西不一样」。
@@ -19,7 +22,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 ARCHIVE=1
-[ "${1:-}" = "--check" ] && ARCHIVE=0
+[ "${1:-}" = "--no-archive" ] && ARCHIVE=0
 
 # --- 平台标签 ---------------------------------------------------------------
 # 标签直接进产物文件名，所以宁可在这里失败，也不要产出一个名字含糊的包。
@@ -89,19 +92,25 @@ SIZE="$(wc -c <"$BIN" | tr -d ' ')"
 echo "▸ 产物：${BIN}（$((SIZE / 1024 / 1024)) MB）"
 
 # --- 冒烟测试 ---------------------------------------------------------------
-# --version 证明能启动；--check 会真的用内置样本合并一次，是打包后唯一能在
-# **构建机上**发现「这个构建的合并坏了」的地方。网络不通不影响自检那一行，
-# 所以这里只要求自检通过，不对网络检查的结果提要求。
+# --version 证明能启动；--selftest 会真的用内置样本合并一次，是打包后唯一能在
+# **构建机上**发现「这个构建的合并坏了」的地方。
+#
+# 这里刻意用 --selftest 而不是 --check：--check 的输出里有中文（"自检通过"），
+# 而 Windows 控制台的默认代码页不是 UTF-8，`grep` 那些字永远不匹配——Windows CI
+# 上真的因此整个 job 失败过一次，失败点看起来还像"合并内核坏了"。--selftest 走
+# 纯 ASCII 输出、不碰网络、退出码就是结论，三个平台判读方式完全一致。
 echo "▸ 冒烟测试"
 "$BIN" --version >/dev/null
 
-CHECK_OUT="$("$BIN" --check 2>&1 || true)"
-if ! grep -q "自检通过" <<<"$CHECK_OUT"; then
+if ! SELFTEST_OUT="$("$BIN" --selftest 2>&1)"; then
     echo "✗ 合并内核自检未通过：" >&2
-    echo "$CHECK_OUT" >&2
+    echo "$SELFTEST_OUT" >&2
     exit 1
 fi
-echo "  ✓ 启动正常，合并内核自检通过"
+# 变量放句尾：`$VAR` 后面紧跟全角括号时，bash 会把那几个字节当成变量名的一部分。
+# 这个坑已经踩过两次（上次是 `$BIN（`），所以 tests/test_packaging.py 里有一条
+# 扫描 packaging/*.sh 的用例专门守它——别再靠人记得。
+echo "  ✓ 启动正常，合并内核自检通过 —— $SELFTEST_OUT"
 
 [ "$ARCHIVE" -eq 0 ] && exit 0
 

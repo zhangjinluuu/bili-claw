@@ -29,8 +29,10 @@ jobs:
       matrix:
         include:
           - { runner: macos-14,         tag: macos-arm64 }
-          # macOS x64 用 macos-13：GitHub 只有这一档是 Intel 机器
-          - { runner: macos-13,         tag: macos-x64 }
+          # macOS x64 用 macos-15-intel。**不要写回 macos-13**：那个镜像 GitHub
+          # 已经下线，标签还在但永远等不到机器，症状是整个 run 一直停在 queued
+          # （不是失败！），于是 publish 永远不触发，而日志里什么线索都没有。
+          - { runner: macos-15-intel,   tag: macos-x64 }
           - { runner: windows-latest,   tag: windows-x64 }
           # Linux x64 刻意钉在 22.04（最老的受支持 LTS）而不是 ubuntu-latest。
           # glibc 向前兼容、向后不兼容：在 24.04 上编出来的二进制在 22.04 上会
