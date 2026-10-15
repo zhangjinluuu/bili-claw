@@ -13,6 +13,9 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.7",
     "pydantic>=2.7",
+    # --login 要从 Chromium 系的 Cookie 库里解密（AES-128-CBC）。这是唯一用到它的地方，
+    # 但「一键取 Cookie」是主打功能，让它需要额外交一步安装就失去意义了，所以列为必装。
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

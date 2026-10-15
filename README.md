@@ -22,6 +22,7 @@ $ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
 - **降级必须告知**：请求 4K 但账号没有大会员时，会明确告诉你实际拿到了什么、为什么
 - **严格模式**：`--on-unavailable fail` 让档位不匹配直接报错退出，适合脚本
 - **登录态解锁**：支持 Cookie 文件，1080P / 1080P+ / 4K / 8K 按账号权限如实反映
+- **一键取 Cookie**：`--login` 直接读本机 Chrome / Edge / Brave / Firefox 的 Cookie 并当场验证
 - **DASH 并发下载**：视频流多分片并发 + 断点续传，中断后重跑同一命令即可继续
 - **CDN 链接过期自动换链**：B站下载链接约 2 小时失效，遇 403 自动重新请求 playurl
 - **无损合并**：只做 remux（`-c copy`），不重新编码，画质音质零损失
@@ -32,11 +33,18 @@ $ bclaw "https://www.bilibili.com/video/BV1xx411c7mD" -q 1080
 需要 **Python 3.12+** 与 **ffmpeg**。
 
 ```bash
-# macOS
+# 先拿到源码
+git clone https://github.com/zhangjinluuu/bili-claw.git
+cd bili-claw
+
+# macOS 装 ffmpeg
 brew install ffmpeg
 
-# 安装 bili-claw
-cd bili-claw
+# 方式一：装成全局命令（推荐，装完在任何目录都能用 bili-claw / bclaw）
+uv tool install --editable .
+uv tool update-shell          # 把 ~/.local/bin 加进 PATH，重开终端生效
+
+# 方式二：用项目自己的虚拟环境
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
 source .venv/bin/activate
@@ -51,6 +59,9 @@ bili-claw --check
 ## 快速开始
 
 ```bash
+# 第一次用：从浏览器取一份 Cookie，解锁 1080P+
+bili-claw --login
+
 # 下载最高可用清晰度
 bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
 
@@ -147,11 +158,44 @@ bili-claw <URL> --codec-compat       # 等价于 --codec avc,hevc，最大兼容
 ## 登录态（1080P+ 的前提）
 
 **未登录最高只能拿到 480P**。1080P 及以上需要登录，4K/8K/HDR 还需要大会员。
-bili-claw 不会代替你登录，你需要自己提供 Cookie：
 
-1. 浏览器登录 B站
-2. 打开开发者工具 → Application → Cookies → `https://www.bilibili.com`
-3. 复制整条 Cookie 字符串（至少要含 `SESSDATA`），或导出为 Netscape 格式
+### 一键取 Cookie（推荐）
+
+只要你在本机浏览器里登录过 B站，就不用去开发者工具里翻：
+
+```bash
+bili-claw --login
+```
+
+```
+✓ 从 Google Chrome · Default · 29 个字段 读到 B站 Cookie
+✓ 已写入：/Users/you/.biliclaw/cookies.txt（权限 600，这是凭据别外传）
+✓ 验证通过：你好萱宝（UID 33162599，非大会员）
+  → 该账号最高可下载：1080P / 1080P60（4K / 8K / HDR 需要大会员）
+```
+
+它会从 **Chrome / Edge / Brave / Chromium / Vivaldi / Firefox** 里找一份当前有效的
+B站 Cookie，写到默认路径（权限 `600`），**并当场向B站验证一次**——所以上面那行
+「验证通过」是真实结果，不是「文件写好了」的另一种说法。
+
+也可以和下载连起来一条命令做完：
+
+```bash
+bili-claw <URL> --login -q 1080      # 取完 Cookie 直接下这一条
+bili-claw --login --cookie-file ~/bili-cookies.txt   # 写到别处
+bili-claw --login --browser firefox  # 指定浏览器（默认 auto，按 Chrome 系优先）
+```
+
+macOS 上读 Chrome 系 Cookie 需要解密钥匙串里的密钥，**首次可能弹一次系统授权框**，
+允许即可；这一步是系统管的，bili-claw 无法代你点。想完全避开弹窗就用 Firefox，
+它的 Cookie 库不加密。
+
+> Safari 的 Cookie 是苹果私有格式且要「完全磁盘访问权限」，**不支持**——
+> 遇到 `--browser safari` 会直接说明原因，而不是静默失败。
+
+### 手动提供 Cookie
+
+一键取不适用时（比如 B站登录在另一台机器上），四条路仍然都在：
 
 ```bash
 # 方式一：放到默认路径，之后所有命令自动带上，不用加参数（推荐）
@@ -170,7 +214,8 @@ export BILICLAW_COOKIE="SESSDATA=xxx"
 bili-claw <URL>
 ```
 
-四种方式按 `--cookie` > `--cookie-file` > 环境变量 > 默认路径 的顺序生效。
+四种方式按 `--cookie` > `--cookie-file` > 环境变量 > 默认路径 的顺序生效，
+默认路径同时兼容 `~/.bilidl/cookies.txt`（见下）。
 
 > 改名（bilidl → BiliClaw）之前放在 `~/.bilidl/cookies.txt` 的文件**仍然会读**，
 > 只是排在新路径之后。想搬就搬，不搬也能用；两个路径都存在时以 `~/.biliclaw` 为准。
@@ -197,6 +242,8 @@ bili-claw <URL>
 --template TEXT           命名模板（默认 {up}/{title}）
 -p, --page TEXT           分P：3 / 1-3 / 1,3,5 / all
 --cookie-file PATH        Cookie 文件
+--login                   从本机浏览器取 B站 Cookie，写入默认路径并当场验证
+--browser TEXT            指定浏览器：auto（默认）| chrome | edge | brave | chromium | vivaldi | firefox | safari
 --concurrency INT         单文件并发分片数（默认 4）
 --limit-rate TEXT         全局限速，如 1M / 500K
 --overwrite               覆盖已存在文件（默认跳过）

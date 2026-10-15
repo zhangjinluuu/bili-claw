@@ -7,6 +7,7 @@ FR-05 合并、FR-07 命名、FR-09 登录态、FR-11 进度与退出码、FR-12
 
 用法示例::
 
+    bclaw --login                                  # 一键从浏览器取登录态（推荐先跑这个）
     bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
     bclaw BV1xx411c7mD -q 720
     bclaw <URL> -q 1080 --cookie-file ~/bili-cookies.txt
@@ -32,9 +33,9 @@ from rich.padding import Padding
 from rich.prompt import Prompt
 from rich.table import Table
 
-from . import __version__, quality
+from . import __version__, browser, quality
 from .api import BiliClient
-from .cookies import is_logged_in, redact, resolve_cookie
+from .cookies import DEFAULT_COOKIE_PATH, is_logged_in, redact, resolve_cookie
 from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
 from .errors import (
     AuthError,
@@ -289,6 +290,8 @@ class Options:
     list_qualities: bool = False
     info_only: bool = False
     check: bool = False
+    login: bool = False
+    browser: str = "auto"
     overwrite: bool = False
     keep_parts: bool = False
     no_merge: bool = False
@@ -761,7 +764,62 @@ async def _reject_expired_cookie(client: BiliClient, source: str) -> None:
     )
 
 
+async def run_login(options: Options, console: Console) -> Path:
+    """``--login``：从本机浏览器取 Cookie、落盘，并**当场验证它真的能登录**。
+
+    验证这一步不能省。只把文件写下去就报成功，等于把"这份 Cookie 到底有没有用"
+    推迟到下一次下载才暴露——而那时用户已经以为自己配好了，看到 480P 只会以为
+    是片源的问题。
+
+    返回写入的路径。
+    """
+    if options.cookie:
+        raise UsageError(
+            "--login 与 --cookie 不能同时使用",
+            hint="--login 是要从浏览器取一份新的凭据；要用手工提供的凭据就直接写 --cookie，别加 --login",
+        )
+
+    target = options.cookie_file or DEFAULT_COOKIE_PATH
+    extraction = browser.extract(options.browser)
+    console.print(f"[green]✓[/green] 从 {extraction.describe()} 读到 B站 Cookie")
+    browser.save(extraction, target)
+    console.print(f"[green]✓[/green] 已写入：{target}（权限 600，这是凭据别外传）")
+
+    async with BiliClient(cookies=extraction.mapping, retries=options.retries) as client:
+        nav = await client.probe_login()
+
+    if nav is None:
+        raise NetworkError(
+            f"Cookie 已存到 {target}，但没能连上 B站接口验证",
+            hint="网络恢复后跑 bili-claw --check 确认；文件已经在那儿了，不用重新取",
+        )
+    if not nav.isLogin:
+        raise AuthError(
+            f"取到 {len(extraction.cookies)} 个字段并已保存，但 B站不认为这是登录态",
+            hint=(
+                "那个浏览器里多半只是没登录 bilibili.com（或者登录态已经过期）。"
+                "确认浏览器打开 bilibili.com 时右上角是自己的头像，再跑一次 --login"
+            ),
+        )
+
+    tier = "大会员" if nav.is_vip() else "非大会员"
+    ceiling = (
+        "4K / 8K / HDR / 杜比（仍取决于片源是否提供）"
+        if nav.is_vip()
+        else "1080P / 1080P60（4K / 8K / HDR 需要大会员）"
+    )
+    console.print(f"[green]✓[/green] 验证通过：{nav.uname}（UID {nav.mid}，{tier}）")
+    console.print(f"  [dim]→ 该账号最高可下载：{ceiling}[/dim]")
+    return target
+
+
 async def run(options: Options, console: Console) -> int:
+    if options.login:
+        await run_login(options, console)
+        if not options.url:
+            # 只想先把登录态准备好，不下载任何东西
+            return ExitCode.OK
+
     request, preference, rate = _validate(options)
 
     if options.check:
@@ -901,6 +959,12 @@ def cli(
     list_qualities: bool = typer.Option(False, "--list-qualities", help="只列出可用清晰度，不下载"),
     info_only: bool = typer.Option(False, "--info", help="只显示视频信息，不下载"),
     check: bool = typer.Option(False, "--check", help="检查 ffmpeg 与登录态后退出"),
+    login: bool = typer.Option(
+        False, "--login", help="从本机浏览器取 B站 Cookie 存下来并验证，可单独使用"
+    ),
+    browser_: str = typer.Option(
+        "auto", "--browser", help="配合 --login：auto / chrome / firefox / edge / brave …"
+    ),
     overwrite: bool = typer.Option(False, "--overwrite", help="覆盖已存在的文件（默认跳过）"),
     keep_parts: bool = typer.Option(False, "--keep-parts", help="合并后保留 .m4s 分片"),
     no_merge: bool = typer.Option(False, "--no-merge", help="只下载分片，不调用 ffmpeg 合并"),
@@ -912,8 +976,8 @@ def cli(
         typer.echo(f"bili-claw {__version__}（哔哩娃娃机 / BiliClaw）")
         raise typer.Exit()
 
-    if not url and not check:
-        err_console.print("[red]请提供视频链接，或使用 --check 检查环境[/red]")
+    if not url and not check and not login:
+        err_console.print("[red]请提供视频链接，或使用 --check / --login[/red]")
         raise typer.Exit(int(ExitCode.USAGE))
 
     configure_logging(debug)
@@ -938,6 +1002,8 @@ def cli(
         list_qualities=list_qualities,
         info_only=info_only,
         check=check,
+        login=login,
+        browser=browser_,
         overwrite=overwrite,
         keep_parts=keep_parts,
         no_merge=no_merge,
