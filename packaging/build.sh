@@ -68,6 +68,29 @@ fail() {
     exit 1
 }
 
+# 把日志尾部压成**一条**能放进 annotation 的字符串。
+#
+# 两个要点：
+#  1. 换行要写成 %0A、百分号要先转成 %25——这是 GitHub 工作流命令的转义约定。
+#     `%` 必须先处理，否则后写的 `%0A` 会被自己再转一遍，变成 `%250A`。
+#  2. 优先从严错那一行开始截，而不是死板地取最后 N 行。PyInstaller 失败时
+#     traceback 前面还压着几十行 INFO（"checking PYZ" 之类），只取尾部恰好会把
+#     真正的原因切掉——上一轮 Windows 失败什么都没查出来，就是这个原因。
+annotation_tail() {
+    local file="$1" count="${2:-25}" text start
+    start="$(grep -n -i -E 'traceback|error|exception' "$file" 2>/dev/null | tail -n 1 | cut -d: -f1 || true)"
+    if [ -n "$start" ] && [ "$start" -gt 8 ]; then
+        text="$(sed -n "$((start - 8)),\$p" "$file" | head -n "$count")"
+    else
+        text="$(tail -n "$count" "$file" 2>/dev/null)"
+    fi
+    text="$(printf '%s' "$text" | tr -d '\r')"
+    # 参数展开里不要加引号：`${text//'%'/'%25'}` 会把引号本身写进结果，
+    # 于是 `%` 变成字面的 `'%25'`。`%` 在模式里不是元字符，不用引。
+    text="${text//%/%25}"
+    printf '%s' "${text//$'\n'/%0A}"
+}
+
 step "platform detected: uname -s='$(uname -s)' uname -m='$(uname -m)' → $TAG"
 
 # --- 解释器与虚拟环境 -------------------------------------------------------
@@ -110,8 +133,23 @@ step "biliclaw $VERSION 可导入，开始 PyInstaller"
 # --- 构建 -------------------------------------------------------------------
 # --clean 是必须的：spec 里改了 EXCLUDES 却复用上一次的缓存时，被排掉的包会
 # 悄悄留在产物里，体积变化就成了唯一线索。
-"$VENV_PY" -m PyInstaller --clean --noconfirm packaging/bclaw.spec \
-    || fail "PyInstaller 构建失败（日志尾部见 annotation）"
+#
+# 输出重定向到文件再判读，而不是直接流给终端：CI 上失败时唯一读得到的通道是
+# annotation，而 GitHub **每个 step 只保留约 10 条**。把 40 行日志一行一条发出去，
+# 真正的报错会被挤掉——Windows 那次就是这样，annotation 里只剩一堆 INFO，看不到
+# 任何 traceback。所以这里压成**一条**。
+PKG_LOG="$ROOT/build/pyinstaller.log"
+mkdir -p "$ROOT/build"
+# `-u` 与 `PYTHONFAULTHANDLER` 不是可有可无的讲究，是那次 Windows 失败逼出来的：
+# 日志停在 "checking EXE" 就断了，连一行 traceback 都没有。两种可能各要一个开关——
+#   1. 输出还压在缓冲区里没落盘 → `-u` 关掉缓冲，最后一行一定留得住；
+#   2. PyInstaller 在 Windows 专属的图标/清单/资源处理里**硬崩**（那段是 ctypes 直接
+#      调 Windows API，访问违例不会产生 Python 异常，只有一个进程级退出码）→
+#      `PYTHONFAULTHANDLER=1` 把致命信号变成一份可见的回溯。
+if ! PYTHONFAULTHANDLER=1 "$VENV_PY" -u -m PyInstaller --clean --noconfirm packaging/bclaw.spec >"$PKG_LOG" 2>&1; then
+    tail -n 60 "$PKG_LOG" >&2
+    fail "PyInstaller 构建失败：$(annotation_tail "$PKG_LOG" 25)"
+fi
 
 if [ ! -f "$BIN" ]; then
     fail "PyInstaller 报成功，但产物 ${BIN} 不在——先看 spec 里的 name 与 dist 路径"

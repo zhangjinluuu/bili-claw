@@ -13,6 +13,8 @@ ubuntu-latest"这类反面教材，不剥的话每一条断言都会被自己的
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -81,25 +83,28 @@ def test_no_variable_is_glued_to_a_non_ascii_character(path: Path) -> None:
 
 
 def test_shell_scripts_are_pinned_to_lf() -> None:
-    """`.gitattributes` 必须把 `*.sh` 钉成 LF——这是 Windows 构建失败的真正根因。
+    """`.gitattributes` 必须把 `*.sh` 钉成 LF。
 
-    Windows runner 的系统 git 配置是 `core.autocrlf=true`，没有 `.gitattributes`
-    时检出会得到 CRLF 的 `build.sh`。bash 随后把回车当成选项名的一部分：
+    **这条不是任何已发生故障的根因，别把它当解释用。** 曾经把它当成 Windows 构建
+    失败的根因写进过注释，那个诊断是错的：`414d3e88` 那次运行发生在 `.gitattributes`
+    存在**之前**，而 Windows 的 annotation 里有
+
+        bclaw-build[windows-x64] platform detected: uname -s='MINGW64_NT-10.0-26100'
+
+    ——脚本在 Windows 上跑起来了。加了 `.gitattributes` 之后的那次运行失败在同一处，
+    一字不差，等于做了一次干净的对照实验，把换行符这个假设排除掉了。
+
+    留着这条规则是因为它防的是**另一类**问题：git 的 `core.autocrlf` 在不同机器上
+    取值不同，某个人的检出真的会得到 CRLF 的 shell 脚本，而症状是
 
         build.sh: line 19: : command not found
         build.sh: line 19: set: pipefail: invalid option name
 
-    脚本在第三行就死了，错误信息里既没有 "windows"，也没有任何指向换行符的线索——
-    四个平台里只有 Windows 挂，而且挂得完全看不出原因。本地能复现：
-
-        git show HEAD:packaging/build.sh | sed 's/$/\\r/' > /tmp/b.sh && bash /tmp/b.sh
-
-    （这条断言和上面那条"用 --selftest 不用 --check"曾经指向同一个故障，但那条
-    的诊断是错的：PyInstaller 冻结后的 `sys.stdout.encoding` 恒为 utf-8，中文输出
-    在 Windows 上并不会丢。真正的原因是换行符。--selftest 仍然保留，理由变成了
-    "它是给脚本判读的信号：纯 ASCII、不碰网络、退出码即结论"。）
+    ——错误信息里既没有 "windows" 也没有任何指向换行符的线索。CI 上恰好没踩到，不代表
+    下一个人在别的机器上踩不到；钉死编码是零成本的（本地复现：
+    `git show HEAD:packaging/build.sh | sed 's/$/\\r/' > /tmp/b.sh && bash /tmp/b.sh`）。
     """
-    assert ATTRIBUTES.is_file(), "缺了 .gitattributes，Windows 检出会得到 CRLF 的 shell 脚本"
+    assert ATTRIBUTES.is_file(), "缺了 .gitattributes，别的检出可能得到 CRLF 的 shell 脚本"
     text = _strip_comments(ATTRIBUTES.read_text(encoding="utf-8"))
     assert re.search(r"^\*\.sh\s+text\s+eol=lf\s*$", text, re.MULTILINE), (
         "`*.sh` 必须显式钉成 `text eol=lf`；只靠 `* text=auto` 挡不住 autocrlf=true"
@@ -125,8 +130,9 @@ def test_build_smoke_test_uses_selftest_not_check() -> None:
     人读的文案（文案一改，CI 就红），而且 Windows 上真的整个 job 失败过一次。
 
     当时把原因归结为"Windows 控制台代码页不是 UTF-8，grep 匹配不上中文"，事后证明
-    **那个诊断是错的**——PyInstaller 冻结后 `sys.stdout.encoding` 恒为 `utf-8`，
-    中文照样输出（真正的故障是 `.gitattributes` 缺位导致的 CRLF，见上）。
+    **那个诊断也是错的**——PyInstaller 冻结后 `sys.stdout.encoding` 恒为 `utf-8`，
+    中文照样输出（Windows 那次失败的真正位置在 PyInstaller 的 EXE 阶段，与编码无关，
+    见 `test_shell_scripts_are_pinned_to_lf` 里记的那次对照实验）。
 
     但 `--selftest` 依然该留着，理由换成了更站得住的那个：它是**给脚本判读的信号**，
     不是给人读的文案——纯 ASCII、不碰网络、退出码就是结论，三个平台的判读方式完全
@@ -160,3 +166,49 @@ def test_linux_x64_is_pinned_to_the_oldest_lts() -> None:
     只约束 build job——`publish` 用 `ubuntu-latest` 没问题，它不产出任何东西。
     """
     assert "ubuntu-latest" not in _build_job()
+
+
+def _extract_bash_function(name: str) -> str:
+    """把 `build.sh` 里的一个函数原样抠出来，好在测试里单独驱动它。"""
+    text = (PACKAGING / "build.sh").read_text(encoding="utf-8")
+    start = text.index(f"{name}() {{")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="需要 bash 才能驱动 shell 函数")
+def test_annotation_tail_escapes_workflow_commands_correctly(tmp_path: Path) -> None:
+    """日志尾部转成 annotation 时的转义必须干净：`%` → `%25`，换行 → `%0A`。
+
+    这个函数**只在 CI 失败的那一刻执行**，本地正常构建永远走不到，所以它坏掉不会
+    有任何征兆——直到最需要它的那次失败。两个坑都真踩过：
+
+      * 顺序反了：先转换行再转 `%`，新写出来的 `%0A` 会被自己再转一遍变成 `%250A`，
+        annotation 里就是一堆乱码，等于白做。
+      * `${text//'%'/'%25'}` 里的引号是**字面量**，`%` 会变成 `'%25'`（引号进结果）。
+
+    还要守住最关键的一条：**得从报错那一行开始截**，而不是死板取最后 N 行。
+    PyInstaller 失败时 traceback 前面压着几十行 INFO，只取尾部恰好会把原因切掉——
+    Windows 那次连续两轮什么都没查出来，就是这个原因。
+    """
+    log = tmp_path / "build.log"
+    log.write_text(
+        "".join(f"{i} INFO: progress 100% done\n" for i in range(1, 31))
+        + "Traceback (most recent call last):\n"
+        + '  File "x.py", line 1\n'
+        + "PermissionError: [WinError 5] Access is denied\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "drive.sh"
+    driver.write_text(
+        "set -euo pipefail\n" + _extract_bash_function("annotation_tail") + '\nannotation_tail "$1" 25\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["bash", str(driver), str(log)], capture_output=True, text=True, check=True)
+    out = result.stdout
+
+    assert "Traceback" in out and "WinError 5" in out, "报错那一段被切掉了"
+    assert "%250A" not in out, "换行被二次转义了：`%0A` 自己又被转了一遍"
+    assert "100%25 done" in out, "真正的 `%` 必须转义成 `%25`，否则 annotation 会被截断"
+    assert "'" not in out, "参数展开里的引号是字面量，% 会变成 '%25'"
+    assert "%0A" in out, "换行必须编码成 %0A，否则 annotation 只有第一行"

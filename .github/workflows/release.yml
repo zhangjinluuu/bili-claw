@@ -66,11 +66,21 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # GitHub 会为每个 ::error:: 生成一条 annotation，匿名可读。
-          # 逐行发是为了保留原始换行——整块塞进一条会被截断。
-          tail -n 40 "$RUNNER_TEMP/build.log" 2>/dev/null | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done || true
+          # GitHub 每个 step **只保留约 10 条** annotation。原先这里逐行发 40 条，
+          # 结果真正的 traceback 被 INFO 行挤掉了——Windows 那次整个 job 只留下
+          # "checking PYZ" 之类的进度行，一点可用的线索都没有。
+          # 现在把整段尾部压成**一条**：换行写 %0A、`%` 必须先转成 %25。
+          log="$RUNNER_TEMP/build.log"
+          [ -f "$log" ] || exit 0
+          start="$(grep -n -i -E 'traceback|error|exception' "$log" | tail -n1 | cut -d: -f1 || true)"
+          if [ -n "$start" ] && [ "$start" -gt 8 ]; then
+            text="$(sed -n "$((start - 8)),\$p" "$log" | head -n 30)"
+          else
+            text="$(tail -n 30 "$log")"
+          fi
+          text="$(printf '%s' "$text" | tr -d '\r')"
+          text="${text//'%'/'%25'}"
+          printf '::error::build log:%0A%s\n' "${text//$'\n'/'%0A'}"
 
       - uses: actions/upload-artifact@v4
         with:
