@@ -427,6 +427,8 @@ src/biliclaw/
   progress.py    进度展示
   errors.py      错误分类与退出码
 packaging/       PyInstaller 配置、构建脚本、安装脚本
+docs/需求文档.md   需求规格说明
+docs/落地计划.md   零依赖 / 跨平台的落地计划与实测记录
 ```
 
 ## 免责声明

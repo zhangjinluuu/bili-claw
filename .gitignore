@@ -25,7 +25,3 @@ release/
 
 # PyInstaller 的构建配置（由 spec 生成，不是手写的源文件）
 *.spec.bak
-
-# 文档：只在本地保留，不进仓库
-docs/
-
