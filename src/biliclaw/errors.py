@@ -42,16 +42,31 @@ class BiliError(Exception):
 
 
 class UsageError(BiliError):
-    """参数/用法错误，或输入指向的资源不可用。"""
+    """命令本身写错了：选项互斥、取值不认识、缺参数。
+
+    ``cli.main`` 会给这类错误补打一整页帮助——用户真正需要的是"到底有哪些选项"。
+    所以继承本类要谨慎：这里的判断标准是**命令敲对了没有**，而不是"退出码是不是 2"。
+    """
 
     exit_code = ExitCode.USAGE
 
 
-class VideoUnavailableError(UsageError):
+class ContentUnavailableError(BiliError):
+    """要的东西不在：稿件下架、这支视频没有那一档清晰度。
+
+    退出码沿用 ``USAGE``（需求文档的 0–7 里只有这一格能表达"你要的东西不可用"），
+    但它**刻意不是 :class:`UsageError`**：用户命令敲得完全正确，只是这支视频没给到
+    他要的那一档。把整页选项表糊在这种错误后面，等于把矛头指向用户自己。
+    """
+
+    exit_code = ExitCode.USAGE
+
+
+class VideoUnavailableError(ContentUnavailableError):
     """稿件不存在、不可见或审核中。"""
 
 
-class QualityUnavailableError(UsageError):
+class QualityUnavailableError(ContentUnavailableError):
     """严格模式下请求的清晰度不可用。"""
 
 

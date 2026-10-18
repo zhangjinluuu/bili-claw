@@ -17,6 +17,7 @@ FR-05 合并、FR-07 命名、FR-09 登录态、FR-11 进度与退出码、FR-12
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shlex
@@ -847,6 +848,12 @@ async def _run_qrcode_login(options: Options, console: Console, target: Path) ->
 
     async with BiliClient(cookies=cookies, retries=options.retries) as client:
         nav = await client.probe_login()
+        # 主动补一次设备指纹：少了 buvid3，playurl 只会回风控挑战（v_voucher），
+        # 一档清晰度都拿不到，而报错现场看起来像"这支视频没有可用的流"。
+        await client.ensure_fingerprint()
+        # 用 client 实际会带上的那一份：上面那一步可能刚补进 buvid3/buvid4。
+        # 存进文件，下次启动就不必再向接口要一次。
+        saved = client.cookies
 
     if nav is None:
         raise NetworkError(
@@ -855,7 +862,7 @@ async def _run_qrcode_login(options: Options, console: Console, target: Path) ->
         )
     if not nav.isLogin:
         raise AuthError(
-            f"扫码拿到了 {len(cookies)} 个字段，但 B站不认为这是登录态",
+            f"扫码拿到了 {len(saved)} 个字段，但 B站不认为这是登录态",
             hint="重新扫一次；反复这样的话，用 bclaw --login 从浏览器取一份作对照",
         )
 
@@ -866,7 +873,7 @@ async def _run_qrcode_login(options: Options, console: Console, target: Path) ->
             profile="扫码登录",
             cookies=tuple(
                 browser.Cookie(name=name, value=value, domain=".bilibili.com")
-                for name, value in cookies.items()
+                for name, value in saved.items()
             ),
         ),
         target,
@@ -1165,7 +1172,8 @@ def cli(
 
     code = asyncio.run(run(options, Console()))
     if code:
-        raise typer.Exit(int(code))
+        # 用 _DomainExit 而不是 typer.Exit：这个 2 是"没下到"的结果，不是"命令敲错了"
+        raise _DomainExit(int(code))
 
 
 def reproduce_command() -> str:
@@ -1301,6 +1309,15 @@ def uninstall_self(console: Console, *, assume_yes: bool) -> int:
     return int(ExitCode.OK)
 
 
+class _DomainExit(SystemExit):
+    """下载/检查的**结果**决定的退出码，而不是命令行解析失败。
+
+    ``main`` 靠它把自己人和 click 分清楚：只有 click 因为"选项不认识/参数缺失"退出时
+    才补打整页帮助。领域结果里也有退出码 2（比如「这支视频没有那一档清晰度」），
+    那不是用户敲错了命令，糊一屏选项表只会把矛头指向他。
+    """
+
+
 def _print_help() -> None:
     """按 ``--help`` 的样子把帮助再渲染一遍。
 
@@ -1309,13 +1326,21 @@ def _print_help() -> None:
 
     调用前已确认是用法错误（退出码 2），错误信息 typer 已经打到 stderr 上了，
     这里只补一份完整帮助。
+
+    帮助**写 stderr**，跟 click 自己的用法错误保持一致：这条路径是"出错了"，而
+    ``bclaw … > out.txt`` 这种重定向下，把一页选项表写进用户的数据文件很难解释。
     """
     argv = sys.argv
     try:
         sys.argv = [argv[0], "--help"]
-        app()
+        with contextlib.redirect_stdout(sys.stderr):
+            app()
     except SystemExit:
         pass
+    except Exception:  # noqa: BLE001 - 见下：帮助是附加信息，不能盖掉真正的错误
+        # 渲染帮助本身失败了，也绝不能让它取代上面那条真正的错误信息——
+        # 用户要读的是「哪里错了」，不是「帮助怎么没画出来」。
+        err_console.print("[dim]（帮助渲染失败；以上面的错误信息为准）[/dim]")
     finally:
         sys.argv = argv
 
@@ -1360,6 +1385,9 @@ def main() -> None:
     _force_utf8_output()
     try:
         app()
+    except _DomainExit:
+        # 自己的结果码：原样交出去，不补帮助（它多半不是 2，也可能是 2）
+        raise
     except SystemExit as exc:
         # 退出码 2 就是"用法错误"——typer/click 的约定与 ExitCode.USAGE 恰好重合。
         # 错误信息 typer 已经打到 stderr 上了，这里再补一份完整帮助：用户敲错一个
@@ -1374,6 +1402,10 @@ def main() -> None:
         if exc.hint:
             for line in exc.hint.splitlines():
                 err_console.print(Padding(f"[dim]→ {line}[/dim]", (0, 0, 0, 2)))
+        # 只有"命令写错了"才配一页帮助。内容不可用（视频下架、这一档没有）退出码
+        # 同为 2，但用户一个字都没敲错，给他看选项表等于答非所问。
+        if isinstance(exc, UsageError):
+            _print_help()
         # 参数类错误不给重跑命令：照着原样再跑一遍只会得到同一个错误，
         # 用户要做的是改参数，不是重试。
         if exc.exit_code != ExitCode.USAGE:

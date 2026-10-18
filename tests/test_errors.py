@@ -125,3 +125,14 @@ def test_risk_control_hint_mentions_the_two_real_causes() -> None:
     hint = error_from_api_code(-352).hint or ""
     assert "并发" in hint or "限速" in hint
     assert "Cookie" in hint
+
+
+def test_content_errors_keep_the_usage_exit_code_but_are_not_usage_errors() -> None:
+    """「这支视频没有这一档」退出码沿用 2，但用户一个字都没敲错。
+
+    这个区别在 ``cli.main`` 里是可见的：只有 ``UsageError`` 才补打整页帮助。
+    把内容不可用做成 ``UsageError``，用户下载失败时会被糊一屏选项表——矛头指错了人。
+    """
+    for error in (VideoUnavailableError("x"), QualityUnavailableError("x")):
+        assert error.exit_code == ExitCode.USAGE
+        assert not isinstance(error, UsageError)

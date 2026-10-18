@@ -42,11 +42,39 @@ USER_AGENT = (
 #: 全开之后由返回结果告诉我们"实际给到了什么"，而不是由我们假设。
 DEFAULT_FNVAL = 4048
 
+#: 设备指纹接口：发一组 ``buvid3`` / ``buvid4``，匿名就能取。
+#:
+#: 这不是"锦上添花"。playurl 少了 ``buvid3`` 时回的既不是错误码也不是 403，而是
+#: **HTTP 200 + code 0 + 只有 ``{"v_voucher": ...}``**——一档清晰度都没有，看着却像
+#: 成功。从浏览器取 Cookie 的那条路是碰巧带了 buvid3 才一直正常；扫码登录、以及
+#: "只粘一段 SESSDATA"都会撞上它，而错误现场指向的是"这支视频没有可用流"。
+FINGER_SPI_PATH = "/x/frontend/finger/spi"
+
 #: ``nav`` 对未登录用户返回 -101「账号未登录」。这不是错误：响应里的
 #: ``data.wbi_img`` 依然有效，未登录本身就是我们想知道的信息。
 NOT_LOGGED_IN = -101
 
 log = logging.getLogger("biliclaw.api")
+
+
+async def fetch_buvid(http: httpx.AsyncClient) -> dict[str, str]:
+    """取一组设备指纹（``buvid3`` / ``buvid4``）。取不到就返回空字典。
+
+    用调用方的 ``http`` 是为了复用连接池与 UA——这个接口对 UA 也挑。
+    """
+    response = await http.get(
+        BASE_URL + FINGER_SPI_PATH,
+        headers={"Referer": REFERER, "User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    data = response.json().get("data") or {}
+    b_3, b_4 = data.get("b_3"), data.get("b_4")
+    if not b_3:
+        return {}
+    found = {"buvid3": str(b_3)}
+    if b_4:
+        found["buvid4"] = str(b_4)
+    return found
 
 
 class BiliClient:
@@ -67,6 +95,8 @@ class BiliClient:
         self._throttle_lock = asyncio.Lock()
         self._wbi_keys: tuple[str, str] | None = None
         self._wbi_day: str | None = None
+        self._buvid_tried = False
+        self._buvid_lock = asyncio.Lock()
 
         self._client = httpx.AsyncClient(
             headers={
@@ -122,6 +152,33 @@ class BiliClient:
         if envelope.code != 0 and envelope.code not in allow_codes:
             raise error_from_api_code(envelope.code, envelope.message)
         return envelope.data
+
+    async def ensure_fingerprint(self) -> None:
+        """确保后续请求带上设备指纹（``buvid3`` / ``buvid4``）。
+
+        只在真正需要它的地方调用——目前是 playurl 与扫码登录的落盘。别的接口
+        不检查这个，为它们多发一次请求只是白花时间。只尝试一次，失败也不影响
+        主流程：这是补充，不该变成每条命令的额外故障点。
+        """
+        if self._buvid_tried or "buvid3" in self._cookies:
+            return
+        async with self._buvid_lock:
+            if self._buvid_tried or "buvid3" in self._cookies:
+                return
+            # 先置标记再发请求：这个接口要是也挂了，我们不希望每条命令都多等它一次。
+            self._buvid_tried = True
+            try:
+                found = await fetch_buvid(self._client)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.debug("取设备指纹失败（%s），本次不带 buvid3", exc.__class__.__name__)
+                return
+            if not found:
+                log.debug("设备指纹接口没给出 b_3，本次不带 buvid3")
+                return
+            self._cookies.update(found)
+            for name, value in found.items():
+                self._client.cookies.set(name, value)
+            log.debug("已补上设备指纹：%s", ", ".join(sorted(found)))
 
     async def _request(
         self,
@@ -206,6 +263,14 @@ class BiliClient:
         log.debug("已刷新 WBI 密钥（img_key=%s…）", self._wbi_keys[0][:8])
         return self._wbi_keys
 
+    @property
+    def cookies(self) -> dict[str, str]:
+        """当前请求实际会带上的 Cookie（可能已自动补上设备指纹）。
+
+        扫码登录用它落盘：``buvid3`` 也存进文件，下次启动就不必再向接口要一次。
+        """
+        return dict(self._cookies)
+
     def invalidate_wbi(self) -> None:
         """丢弃缓存的 WBI 密钥，下次签名时重新获取。
 
@@ -256,11 +321,22 @@ class BiliClient:
         ``qn`` 只是"希望值"——B站会按账号权限静默降级，真实档位以返回的
         ``dash.video[].id`` 为准（见 ``quality`` 模块的说明）。
         """
+        await self.ensure_fingerprint()
         data = await self._request(
             "/x/player/wbi/playurl",
             {"bvid": bvid, "cid": cid, "qn": qn, "fnval": fnval, "fourk": fourk},
             signed=True,
         )
+        # v_voucher 是风控软挑战：HTTP 200、code 0，但没有任何 dash/durl。不在这里
+        # 拦下，上层看到的就是"这支视频没有可用的流"——一句把矛头指向视频和账号的话。
+        if "v_voucher" in data and not data.get("dash") and not data.get("durl"):
+            raise RiskControlError(
+                "B站只回了风控挑战（v_voucher），没有给播放地址",
+                hint=(
+                    "通常是设备指纹缺失或当前网络被标记。本程序会自动补 buvid3 后重试；"
+                    "仍失败就换一次网络，或把浏览器里那份完整 Cookie 用 --cookie 给过来"
+                ),
+            )
         return self._validate(PlayUrlData, data, path="/x/player/wbi/playurl")
 
     async def probe_login(self) -> NavData | None:

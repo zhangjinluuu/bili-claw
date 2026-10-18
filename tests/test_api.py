@@ -236,3 +236,65 @@ async def test_none_params_are_dropped() -> None:
 
     assert "aid" not in seen[0]
     assert "bvid=BV1xx411c7mD" in seen[0]
+
+
+# --------------------------------------------------------------------------- #
+# 设备指纹（buvid3）—— 没有它 playurl 只回风控挑战
+# --------------------------------------------------------------------------- #
+
+
+async def test_ensure_fingerprint_fills_in_buvid3_and_only_asks_once() -> None:
+    """设备指纹只取一次：它是补充信息，不该变成每条命令的固定开销。"""
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=_envelope(data={"b_3": "DEVICE", "b_4": "DEVICE4"}))
+
+    client = await _client(handler)
+    await client.ensure_fingerprint()
+    await client.ensure_fingerprint()
+    await client.aclose()
+
+    assert seen == ["/x/frontend/finger/spi"]
+    assert client.cookies["buvid3"] == "DEVICE"
+    assert client.cookies["buvid4"] == "DEVICE4"
+
+
+async def test_ensure_fingerprint_respects_a_buvid3_the_caller_already_has() -> None:
+    """从浏览器取来的 Cookie 自带 buvid3，那就一个请求都不要多发。"""
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=_envelope(data={"b_3": "NEW"}))
+
+    client = BiliClient(cookies={"buvid3": "MINE"}, retries=0, min_interval=0.0)
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await client.ensure_fingerprint()
+    await client.aclose()
+
+    assert seen == []
+    assert client.cookies["buvid3"] == "MINE"
+
+
+async def test_playurl_turns_a_v_voucher_reply_into_risk_control() -> None:
+    """只有 v_voucher、没有 dash：这是风控软挑战，不是「这支视频没有可用的流」。
+
+    现场最误导的地方在于它是 HTTP 200 + code 0——一层层看下来都像成功。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_envelope(data={"v_voucher": "voucher_x"}))
+
+    client = await _client(handler)
+    # 直接给 WBI 密钥，跳过 nav 那一步：这里要验的是对 playurl 返回值的判断
+    client._wbi_keys = ("0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210")
+    import time
+
+    client._wbi_day = time.strftime("%Y-%m-%d")
+
+    with pytest.raises(RiskControlError, match="v_voucher"):
+        await client.playurl(bvid="BV1xx411c7mD", cid=1)
+    await client.aclose()

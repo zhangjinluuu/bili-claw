@@ -413,7 +413,11 @@ def test_unknown_option_shows_the_full_help(
     assert "No such option: --nonexistent" in captured.err
     # `--list-qualities` 只出现在帮助表格里，错误信息里绝不会有——用它证明整份
     # 帮助真的被渲染出来了，而不只是那两行 Usage。
-    assert "--list-qualities" in captured.out
+    #
+    # 帮助落在 **stderr**：这条路径是"出错了"，和 click 自己的用法错误保持一致，
+    # 免得 `bclaw … > out.txt` 把一页选项表写进用户的数据文件。
+    assert "--list-qualities" in captured.err
+    assert captured.out == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -539,3 +543,50 @@ def test_uninstall_leaves_a_foreign_symlink_alone(
 
     assert alias not in targets
     assert targets[-1] == binary
+
+
+def test_usage_errors_get_the_full_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    """命令敲错了才配一页选项表——用户这时候最想知道"到底有哪些选项"。"""
+    printed: list[bool] = []
+    monkeypatch.setattr(cli, "_print_help", lambda: printed.append(True))
+
+    def _boom() -> None:
+        raise UsageError("无法识别的清晰度：99999")
+
+    monkeypatch.setattr(cli, "app", _boom)
+    with pytest.raises(SystemExit):
+        main()
+
+    assert printed == [True]
+
+
+def test_content_failures_do_not_get_the_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    """视频没有那一档，退出码同为 2，但这不是"命令敲错了"。"""
+    printed: list[bool] = []
+    monkeypatch.setattr(cli, "_print_help", lambda: printed.append(True))
+
+    def _boom() -> None:
+        raise QualityUnavailableError("该视频没有可用的 DASH 视频流")
+
+    monkeypatch.setattr(cli, "app", _boom)
+    with pytest.raises(SystemExit) as info:
+        main()
+
+    assert info.value.code == int(ExitCode.USAGE)
+    assert printed == []
+
+
+def test_a_domain_exit_never_prints_the_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    """下载结果是 2（比如「没下到」）时，走的是 _DomainExit，不该被当成用法错误。"""
+    printed: list[bool] = []
+    monkeypatch.setattr(cli, "_print_help", lambda: printed.append(True))
+
+    def _boom() -> None:
+        raise cli._DomainExit(int(ExitCode.USAGE))
+
+    monkeypatch.setattr(cli, "app", _boom)
+    with pytest.raises(SystemExit) as info:
+        main()
+
+    assert info.value.code == int(ExitCode.USAGE)
+    assert printed == []
