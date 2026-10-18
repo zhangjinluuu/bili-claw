@@ -33,8 +33,9 @@ from rich.logging import RichHandler
 from rich.padding import Padding
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
-from . import __version__, browser, quality
+from . import __version__, browser, qrlogin, quality
 from .api import BiliClient
 from .cookies import DEFAULT_COOKIE_PATH, is_logged_in, redact, resolve_cookie
 from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
@@ -47,7 +48,7 @@ from .errors import (
     QualityUnavailableError,
     UsageError,
 )
-from .models import Page, PlayUrlData, VideoInfo
+from .models import NavData, Page, PlayUrlData, VideoInfo
 from .muxer import choose_container, find_ffmpeg, merge, verify_output
 from .naming import TEMPLATE_FIELDS, render_path, template_fields, validate_template
 from .progress import ProgressReporter
@@ -302,6 +303,7 @@ class Options:
     info_only: bool = False
     check: bool = False
     login: bool = False
+    qrcode: bool = False
     browser: str = "auto"
     overwrite: bool = False
     keep_parts: bool = False
@@ -791,6 +793,89 @@ async def _reject_expired_cookie(client: BiliClient, source: str) -> None:
     )
 
 
+def _report_account(nav: NavData, console: Console) -> None:
+    """登录成功后，把「登进了谁、能下到多高」说清楚。
+
+    两条登录路径（浏览器 / 扫码）共用同一段。抽出来是因为它的**内容**比它的位置
+    重要——用户判断"这次到底成没成"全看这两行。
+    """
+    tier = "大会员" if nav.is_vip() else "非大会员"
+    ceiling = (
+        "4K / 8K / HDR / 杜比（仍取决于片源是否提供）"
+        if nav.is_vip()
+        else "1080P / 1080P60（4K / 8K / HDR 需要大会员）"
+    )
+    console.print(f"[green]✓[/green] 验证通过：{nav.uname}（UID {nav.mid}，{tier}）")
+    console.print(f"  [dim]→ 该账号最高可下载：{ceiling}[/dim]")
+
+
+async def _run_qrcode_login(options: Options, console: Console, target: Path) -> Path:
+    """``--login --qrcode``：在终端里画二维码，用户用 B站 App 扫。
+
+    和从浏览器取 Cookie 的那条路相比，这条**完全不碰浏览器**：没登录过网页版的机器
+    也能用，也不会去碰钥匙串 / DPAPI。
+
+    两个顺序刻意与 ``run_login`` 相反：
+
+    1. **先画码再轮询**。反过来，用户就对着空屏幕等一个看不见的东西。
+    2. **先验证再落盘**。浏览器那条路只能先存后验（凭据已经从浏览器里捞出来了），
+       而这条的 Cookie 还在内存里——验不过就不写，免得磁盘上留一个"看着像登录态、
+       实际是废的"文件，等下一次下载才发现。
+    """
+    if not console.is_terminal:
+        raise UsageError(
+            "--qrcode 要在终端里画二维码，当前输出不是终端",
+            hint="改用 bclaw --login（从本机浏览器取 Cookie），或用 --cookie 手工给",
+        )
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0),
+        follow_redirects=True,
+    ) as http:
+        ticket = await qrlogin.fetch_ticket(http)
+        # 「黑字白底」是显式指定的，不交给终端主题决定：二维码必须深模块压浅底，
+        # 反色的码有不小比例的扫描器认不出来。
+        for line in qrlogin.render_qr(ticket.url):
+            console.print(Text(line, style="black on white"))
+        console.print(
+            "  [dim]用 B站 App 扫这个码，再在手机上点「确认登录」（180 秒内有效）[/dim]"
+        )
+        with console.status("等待扫码…") as status:
+            cookies = await qrlogin.wait_for_login(
+                http, ticket, on_state=lambda state: status.update(state.as_text())
+            )
+
+    async with BiliClient(cookies=cookies, retries=options.retries) as client:
+        nav = await client.probe_login()
+
+    if nav is None:
+        raise NetworkError(
+            "扫码拿到 Cookie 了，但没能连上 B站接口验证",
+            hint="网络恢复后再跑一次；这次什么都没写，磁盘上不会有半截登录态",
+        )
+    if not nav.isLogin:
+        raise AuthError(
+            f"扫码拿到了 {len(cookies)} 个字段，但 B站不认为这是登录态",
+            hint="重新扫一次；反复这样的话，用 bclaw --login 从浏览器取一份作对照",
+        )
+
+    # 复用 browser.save 而不是另写一份写盘逻辑：0600 权限那套已经在那儿验证过了。
+    browser.save(
+        browser.Extraction(
+            browser="B站 App",
+            profile="扫码登录",
+            cookies=tuple(
+                browser.Cookie(name=name, value=value, domain=".bilibili.com")
+                for name, value in cookies.items()
+            ),
+        ),
+        target,
+    )
+    console.print(f"[green]✓[/green] 已写入：{target}（权限 600，这是凭据别外传）")
+    _report_account(nav, console)
+    return target
+
+
 async def run_login(options: Options, console: Console) -> Path:
     """``--login``：从本机浏览器取 Cookie、落盘，并**当场验证它真的能登录**。
 
@@ -807,6 +892,9 @@ async def run_login(options: Options, console: Console) -> Path:
         )
 
     target = options.cookie_file or DEFAULT_COOKIE_PATH
+    if options.qrcode:
+        return await _run_qrcode_login(options, console, target)
+
     extraction = browser.extract(options.browser)
     console.print(f"[green]✓[/green] 从 {extraction.describe()} 读到 B站 Cookie")
     browser.save(extraction, target)
@@ -829,14 +917,7 @@ async def run_login(options: Options, console: Console) -> Path:
             ),
         )
 
-    tier = "大会员" if nav.is_vip() else "非大会员"
-    ceiling = (
-        "4K / 8K / HDR / 杜比（仍取决于片源是否提供）"
-        if nav.is_vip()
-        else "1080P / 1080P60（4K / 8K / HDR 需要大会员）"
-    )
-    console.print(f"[green]✓[/green] 验证通过：{nav.uname}（UID {nav.mid}，{tier}）")
-    console.print(f"  [dim]→ 该账号最高可下载：{ceiling}[/dim]")
+    _report_account(nav, console)
     return target
 
 
@@ -989,6 +1070,9 @@ def cli(
     login: bool = typer.Option(
         False, "--login", help="从本机浏览器取 B站 Cookie 存下来并验证，可单独使用"
     ),
+    qrcode: bool = typer.Option(
+        False, "--qrcode", help="配合 --login：不碰浏览器，用 B站 App 扫码登录"
+    ),
     browser_: str = typer.Option(
         "auto", "--browser", help="配合 --login：auto / chrome / firefox / edge / brave …"
     ),
@@ -1037,6 +1121,12 @@ def cli(
         # 才敢提问（见 `_can_prompt`），这里的判断必须基于面向用户的那个流。
         raise typer.Exit(uninstall_self(Console(), assume_yes=assume_yes))
 
+    # 单独一个 --qrcode 什么也不做：它是 --login 的取凭据方式，不是独立命令。
+    # 不说清楚的话，用户看到的是「请提供视频链接」——那和扫码毫无关系。
+    if qrcode and not login:
+        err_console.print("[red]--qrcode 要配合 --login 使用：bclaw --login --qrcode[/red]")
+        raise typer.Exit(int(ExitCode.USAGE))
+
     if not url and not check and not login:
         err_console.print("[red]请提供视频链接，或使用 --check / --login[/red]")
         raise typer.Exit(int(ExitCode.USAGE))
@@ -1064,6 +1154,7 @@ def cli(
         info_only=info_only,
         check=check,
         login=login,
+        qrcode=qrcode,
         browser=browser_,
         overwrite=overwrite,
         keep_parts=keep_parts,

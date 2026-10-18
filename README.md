@@ -23,6 +23,7 @@ $ bclaw BV17wpp6SEe9 -q 1080
 - **严格模式**：`--on-unavailable fail` 让档位不匹配直接报错退出，适合脚本
 - **登录态解锁**：支持 Cookie 文件，1080P / 1080P+ / 4K / 8K 按账号权限如实反映
 - **一键取 Cookie**：`--login` 直接读本机浏览器的 Cookie 并当场验证（支持矩阵见下）
+- **手机扫码也能登录**：`--login --qrcode` 在终端里画二维码，用 B站 App 扫——不碰浏览器、不读钥匙串
 - **DASH 并发下载**：视频流多分片并发 + 断点续传，中断后重跑同一命令即可继续
 - **CDN 链接过期自动换链**：B站下载链接约 2 小时失效，遇 403 自动重新请求 playurl
 - **无损合并，且不依赖 ffmpeg**：合并由程序自己完成，只做 remux，不重新编码，画质音质零损失
@@ -251,12 +252,42 @@ AES-128、Linux 用同一套但**迭代次数不同**、Windows 是 DPAPI 保护
 > Chrome 127+ 的新方案，本工具不做（正规解法只有从浏览器进程里读内存，那和恶意软件的手法
 > 没有区别）。请改用 Firefox，或用手动方式提供 Cookie。
 
+#### 完全不用浏览器：手机扫码登录
+
+```bash
+bclaw --login --qrcode
+```
+
+```
+▄▄▄▄▄▄▄  ▄▀▄█▀▀ ███▄▀▄▄█ ▄ ▄ ▄█▀ ▀▄█▀█▄▄█ █▀▀▀▀▀█
+█ ███ █  █▄ ██▀ █▄█ █ ▄▀▀██▀▄▀▄▄▄▀▄██▄▄ █▀ █ ███ █
+█ ▀▀▀ █  █▀▄██▀▄█▀▀█▄ ▀█▀▀▀█▄▄▀▀▄▀▄▄██▀▄   █ ▀▀▀ █
+▀▀▀▀▀▀▀  █ █▄█ █ █ ▀ ▀ █ ▀ █ █▄█▄█ ▀▄▀▄█▄▀ ▀▀▀▀▀▀▀
+   …（终端里画出的二维码）
+用 B站 App 扫这个码，再在手机上点「确认登录」（180 秒内有效）
+✓ 登录成功：XXXX（UID xxxxxxxx，非大会员）
+✓ 已写入：/Users/you/.biliclaw/cookies.txt（权限 600，这是凭据别外传）
+  → 该账号最高可下载：1080P / 1080P60
+```
+
+这条路**完全不碰浏览器**：不需要钥匙串授权，也不受 Chrome 127+ App-Bound 加密的限制，
+在服务器、容器、刚装好的机器上都能用——只要有终端和手机。
+
+两个和浏览器那条路不同的地方，都是刻意的：
+
+- **先验证再落盘。** 浏览器那条路只能先存后验（凭据已经从浏览器里捞出来了），而这里的
+  Cookie 还在内存里——B站不认，就一个字节都不写，不会在磁盘上留一个「看着像登录态、
+  实际是废的」文件，等下次下载才发现。
+- **二维码在本机生成。** 码里编的是这次登录的 `qrcode_key`，谁的手机先扫完，被扫码的
+  这一端就存下谁的账号——把它发给任何一个二维码生成服务，等于把登录会话交出去。
+
 也可以和下载连起来一条命令做完：
 
 ```bash
 bclaw BV17wpp6SEe9 --login -q 1080      # 取完 Cookie 直接下这一条
 bclaw --login --cookie-file ~/bili-cookies.txt   # 写到别处
 bclaw --login --browser firefox  # 指定浏览器（默认 auto，按 Chrome 系优先）
+bclaw BV17wpp6SEe9 --login --qrcode      # 扫码登录，然后直接下这一条
 ```
 
 想完全避开授权弹窗就用 **Firefox**：它的 `cookies.sqlite` 在三个平台上**都是明文**，
@@ -316,6 +347,7 @@ bclaw BV17wpp6SEe9
 -p, --page TEXT           分P：3 / 1-3 / 1,3,5 / all
 --cookie-file PATH        Cookie 文件
 --login                   从本机浏览器取 B站 Cookie，写入默认路径并当场验证
+--qrcode                  配合 --login：不碰浏览器，在终端里画二维码用 B站 App 扫
 --browser TEXT            指定浏览器：auto（默认）| chrome | edge | brave | chromium | vivaldi | firefox | safari
 --concurrency INT         单文件并发分片数（默认 4）
 --limit-rate TEXT         全局限速，如 1M / 500K
@@ -438,6 +470,7 @@ src/biliclaw/
   wbi.py         WBI 签名（w_rid 计算）
   cookies.py     Cookie 加载、校验、脱敏
   browser.py     从本机浏览器提取 Cookie（--login，三平台）
+  qrlogin.py     扫码登录：要二维码、轮询状态、在终端里画码（--login --qrcode）
   models.py      接口响应数据模型
   quality.py     清晰度协商与降级判定
   downloader.py  分片并发下载与断点续传

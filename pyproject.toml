@@ -16,6 +16,10 @@ dependencies = [
     # --login 要从 Chromium 系的 Cookie 库里解密（AES-128-CBC）。这是唯一用到它的地方，
     # 但「一键取 Cookie」是主打功能，让它需要额外交一步安装就失去意义了，所以列为必装。
     "cryptography>=42",
+    # --login --qrcode 要在终端里画二维码。选 segno 是因为它纯 Python、零运行时依赖、
+    # 不需要 Pillow（77 KB），而二维码**必须在本地生成**：二维码里编的是本次登录的
+    # qrcode_key，谁拿到它谁就能用自己的手机扫完，让用户存下别人的账号。
+    "segno>=1.6",
 ]
 
 [project.optional-dependencies]
