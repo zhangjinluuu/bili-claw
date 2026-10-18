@@ -351,3 +351,37 @@ def test_build_smoke_test_forces_a_non_utf8_encoding() -> None:
     # 只检查退出码不够：stdout 与 stderr 合并捕获了，一个什么都不打就退出的产物也会
     # "通过"——而"什么都不打"正是编码出问题时的典型症状。
     assert 'grep -q "bili-claw"' in text, "还要确认 cp1252 下真的打出了内容"
+
+
+def test_every_curl_call_can_stop_waiting() -> None:
+    """`install.sh` 里的每条 curl 都必须能自己停下来。
+
+    有人报"装到一半一直阻塞"。现场复现下来，这句话其实是两件事叠在一起：
+
+    1. **没有超时**。`curl -fsSL` 不带 `--connect-timeout` 时用的是操作系统的 TCP
+       超时（macOS 上约 75 秒）；而 `github.com` 在某些网络下是整段不通的——DNS 正常
+       返回 `20.205.243.166`，TCP 直接黑洞。探测三次全是
+       `(28) Failed to connect to github.com port 443 after 10003 ms`，十分钟后
+       同一个 IP 又变成 `200` 用 0.18 秒。也就是说它是**间歇**的，赶上了就一直等。
+    2. **没有进度**。`-s` 把 progress meter 一并静音了，于是 18.7MB 的包在 ~24 KB/s
+       的链路上要下十三分钟，而这十三分钟里终端只有一行 `▸ 下载 <url>`。在用户看来
+       和死掉了没有区别——**它其实一直在下，只是什么都不说**。
+
+    所以这条断言看两样：每条 curl 都有 `--connect-timeout`，以及那个真正搬大文件的
+    下载带 `--progress-bar`。
+    """
+    text = _strip_comments((PACKAGING / "install.sh").read_text(encoding="utf-8"))
+    # 反斜杠续行先拼起来，否则"参数写在下一行"会被误判成没写
+    joined = re.sub(r"\\\n\s*", " ", text)
+
+    calls = [line.strip() for line in joined.splitlines() if re.search(r"\bcurl\s+-", line)]
+    assert calls, "一条 curl 都没匹配到——正则失效了"
+
+    missing = [line for line in calls if "--connect-timeout" not in line]
+    assert not missing, "这些 curl 没有 --connect-timeout，网络悬空时会一直等：\n" + "\n".join(missing)
+
+    download = [line for line in calls if "-o " in line and "ARCHIVE" in line]
+    assert download, "没找到下载归档的那条 curl——它被改写了？"
+    assert all("--progress-bar" in line for line in download), (
+        "下载 18MB 的那条 curl 必须显示进度：静默模式下『正在下载』和『卡死』在用户眼里没区别"
+    )

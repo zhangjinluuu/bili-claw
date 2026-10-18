@@ -58,7 +58,10 @@ command -v tar  >/dev/null 2>&1 || die "需要 tar"
 # latest 那条重定向就会 404，而预发布正是我们验证期的常态。API 拿不到时
 # （限流、离线）再退回 latest 重定向，两条路都留。
 if [ -z "$VERSION" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
+    # 这里必须设超时：拿不到 tag 只是退化成 latest 重定向，一条兜底的信息不值得
+    # 让用户对着空屏幕等下去（curl 默认用操作系统的 TCP 超时，连接悬空时是几十秒）。
+    VERSION="$(curl -fsSL --connect-timeout 8 --max-time 20 \
+        "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
 fi
 
@@ -77,8 +80,21 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 printf '▸ 下载 %s\n' "$URL"
-curl -fsSL "$URL" -o "$TMP/$ARCHIVE" \
-    || die "下载失败。若这是首次发布，请确认 $ARCHIVE 已挂在该版本的 Release 上。"
+# 这里每个参数都不是装饰：
+#   --connect-timeout 10  没有它时 curl 用操作系统的 TCP 超时（macOS 上约 75 秒）。
+#                         GitHub 的部分边缘节点在有些网络里是整段不通的（DNS 正常、
+#                         TCP 直接黑洞），症状就是「敲完命令后终端一片空白」。
+#   --retry 3             链路抖动很常见，重试三次比让用户自己重跑整个脚本便宜。
+#   --progress-bar        静默模式下 18MB 的下载和「卡死」在用户眼里没有区别。
+if ! curl -fL --connect-timeout 10 --retry 3 --retry-delay 2 --progress-bar \
+        "$URL" -o "$TMP/$ARCHIVE"; then
+    printf '\n' >&2
+    die "下载失败：$URL
+    1) 连不上 github.com —— 换网络，或先设代理再重跑：
+         export https_proxy=http://127.0.0.1:7890
+    2) 这个版本没挂 $ARCHIVE —— 用 BCLAW_VERSION=<已发布的版本> 指定
+    3) 想手动装：浏览器打开上面的 URL，解开后把 bclaw 放进 $INSTALL_DIR"
+fi
 
 tar xzf "$TMP/$ARCHIVE" -C "$TMP" || die "解压失败，下载到的可能不是一个 tar.gz"
 
