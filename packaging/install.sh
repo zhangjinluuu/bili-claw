@@ -121,3 +121,4 @@ esac
 printf '\n下一步：\n'
 printf '  bclaw --check         # 确认环境与登录态\n'
 printf '  bclaw --login         # 从本机浏览器取一次 B站 Cookie（下载 720P 以上需要）\n'
+printf '  bclaw --uninstall     # 以后不想用了：连程序带 Cookie 一起删掉\n'

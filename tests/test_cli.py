@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import sys
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -370,3 +371,171 @@ def test_force_utf8_output_swallows_reconfigure_failures(monkeypatch: pytest.Mon
         cli._force_utf8_output()  # 不抛就算过
 
     assert out.calls == [] and err.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# 帮助（-h / 敲错选项）
+# --------------------------------------------------------------------------- #
+
+
+def test_dash_h_prints_exactly_what_double_dash_help_prints(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`-h` 是几乎所有命令行工具的肌肉记忆，而 typer 默认只认 `--help`。"""
+
+    def _help_output(flag: str) -> str:
+        monkeypatch.setattr(sys, "argv", ["bclaw", flag])
+        with pytest.raises(SystemExit) as caught:
+            main()
+        assert caught.value.code == int(ExitCode.OK)
+        return capsys.readouterr().out
+
+    short, long = _help_output("-h"), _help_output("--help")
+    # 只看帮助里稳定的部分：程序名是 click 从 `sys.argv[0]` 推出来的，在 pytest 里
+    # 会被认成 "python -m pytest"，拿它做断言等于在测 click 的探测逻辑。
+    assert "Usage:" in short
+    assert "--list-qualities" in short
+    # 断言两者**逐字相同**，而不是"都提到了 Usage"：需求要的是同一份内容，
+    # 一旦哪天有人只改了其中一条路径，这个等式就会立刻红。
+    assert short == long
+
+
+def test_unknown_option_shows_the_full_help(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """敲错一个选项时，用户最想看的是"到底有哪些选项"，而不只是"你敲错了"。"""
+    monkeypatch.setattr(sys, "argv", ["bclaw", "--nonexistent"])
+    with pytest.raises(SystemExit) as caught:
+        main()
+
+    assert caught.value.code == int(ExitCode.USAGE)
+    captured = capsys.readouterr()
+    assert "No such option: --nonexistent" in captured.err
+    # `--list-qualities` 只出现在帮助表格里，错误信息里绝不会有——用它证明整份
+    # 帮助真的被渲染出来了，而不只是那两行 Usage。
+    assert "--list-qualities" in captured.out
+
+
+# --------------------------------------------------------------------------- #
+# 卸载（--uninstall）
+# --------------------------------------------------------------------------- #
+
+
+def _install_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """在临时目录里铺一套和 `packaging/install.sh` 完全一样的布局。"""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    binary = bindir / "bclaw"
+    binary.write_bytes(b"x" * 32)
+    alias = bindir / "bili-claw"
+    alias.symlink_to("bclaw")
+    cookies = tmp_path / ".biliclaw" / "cookies.txt"
+    cookies.parent.mkdir()
+    cookies.write_text("SESSDATA=secret", encoding="utf-8")
+    return binary, alias, cookies
+
+
+def test_uninstall_takes_away_everything_install_sh_laid_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卸载要把安装脚本铺下去的三样东西都带走：程序本体、别名软链、登录态。"""
+    binary, alias, cookies = _install_layout(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "installed_binary", lambda: binary)
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", cookies)
+        patch.setattr(sys, "argv", ["bclaw", "--uninstall", "--yes"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.OK)
+    assert not binary.exists()
+    assert not alias.is_symlink()
+    # Cookie 是能直接冒充用户身份的东西，程序没了它更不该留在机器上。
+    assert not cookies.parent.exists()
+    assert "已卸载 bclaw" in capsys.readouterr().out
+
+
+def test_uninstall_keeps_everything_when_the_user_says_no(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """"一键"省的是手动 find+rm 的功夫，不是省掉用户确认的权利。"""
+    binary, alias, cookies = _install_layout(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "installed_binary", lambda: binary)
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", cookies)
+        patch.setattr(cli, "_can_prompt", lambda console: True)
+        patch.setattr(cli.Prompt, "ask", lambda *args, **kwargs: "n")
+        patch.setattr(sys, "argv", ["bclaw", "--uninstall"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.OK)
+    assert binary.exists()
+    assert alias.is_symlink()
+    assert cookies.exists()
+    assert "什么都没删" in capsys.readouterr().out
+
+
+def test_uninstall_refuses_to_guess_when_nobody_can_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """管道/CI 里 stdin 不在终端上，此时不能默默删掉用户的东西，也不能干等。"""
+    binary, alias, cookies = _install_layout(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "installed_binary", lambda: binary)
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", cookies)
+        patch.setattr(cli, "_can_prompt", lambda console: False)
+        patch.setattr(sys, "argv", ["bclaw", "--uninstall"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.USAGE)
+    assert "--yes" in capsys.readouterr().err
+    assert binary.exists() and alias.is_symlink() and cookies.exists()
+
+
+def test_uninstall_reports_a_locked_binary_instead_of_claiming_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Windows 删不掉正在运行的程序——这时说"已卸载"就是撒谎。"""
+    binary, alias, cookies = _install_layout(tmp_path)
+    real_unlink = Path.unlink
+
+    def _unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self == binary:
+            raise PermissionError(13, "另一个程序正在使用此文件")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "installed_binary", lambda: binary)
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", cookies)
+        patch.setattr(Path, "unlink", _unlink)
+        patch.setattr(sys, "argv", ["bclaw", "--uninstall", "--yes"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.FILESYSTEM)
+    out = capsys.readouterr().out
+    assert "没删掉" in out
+    assert "已卸载 bclaw" not in out
+    # 本体被占用时，排在它前面的软链已经删掉了——这正是把本体放在最后的目的。
+    assert not alias.is_symlink()
+
+
+def test_uninstall_leaves_a_foreign_symlink_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`~/.local/bin` 是公共目录，同名软链未必是我们铺的。"""
+    binary, alias, cookies = _install_layout(tmp_path)
+    alias.unlink()
+    alias.symlink_to("/usr/local/bin/something-else")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", cookies)
+        targets = cli.uninstall_targets(binary)
+
+    assert alias not in targets
+    assert targets[-1] == binary

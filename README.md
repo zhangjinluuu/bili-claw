@@ -304,6 +304,7 @@ bclaw BV17wpp6SEe9
 ## 常用参数
 
 ```
+-h, --help                显示完整帮助
 -q, --quality TEXT        清晰度：max / ask / 1080 / 720 / 80 / 116 …
 --on-unavailable TEXT     档位不可用：degrade（默认）| fail
 --codec TEXT              编码偏好，如 avc,hevc
@@ -323,7 +324,27 @@ bclaw BV17wpp6SEe9
 --no-merge                只下载分片，不合并
 -Q, --quiet               不显示进度条
 --debug                   输出调试日志
+--version                 显示版本
+--uninstall               卸载 bclaw：删掉程序本体与本机保存的登录态
+-y, --yes                 配合 --uninstall：不再询问，直接删
 ```
+
+敲错选项时不会只丢一句 `No such option`——程序会把这个错误和**完整的帮助**一起打出来，
+省掉"哦，那我再敲一次 `--help`"这一轮。
+
+### 卸载
+
+```bash
+bclaw --uninstall      # 先列出要删的东西，再问一次；确认后才动手
+bclaw --uninstall --yes   # 脚本里用这个跳过询问
+```
+
+删三样：程序本体（`~/.local/bin/bclaw`）、别名软链（`~/.local/bin/bili-claw`），
+以及 `~/.biliclaw/`（`--login` 存下的 Cookie——它是能直接冒充你身份的凭据，
+程序都卸了更不该留在机器上）。
+
+删除不可撤销，所以默认先列出清单再让你确认。Windows 不允许删除正在运行的程序，
+那一条会如实报告失败、退出码 7，关掉窗口后手动删掉即可——**不会**假报成功。
 
 ### Cookie 失效了会怎样
 

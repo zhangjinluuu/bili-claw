@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 import shlex
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ from .selftest import check_merge
 
 app = typer.Typer(
     add_completion=False,
+    # `-h` 是几乎所有命令行工具的肌肉记忆。typer/click 只自动加 `--help`，
+    # 敲 `-h` 会得到 "No such option: -h"——用户的第一反应是"这程序没帮助"。
+    context_settings={"help_option_names": ["-h", "--help"]},
     help=(
         "哔哩娃娃机 / BiliClaw —— 投币，出爪，把喜欢抓回家。\n\n"
         "支持清晰度选择、Cookie 登录下载 1080P+、DASH 并发下载与内置的无损合并。\n\n"
@@ -994,6 +998,12 @@ def cli(
     quiet: bool = typer.Option(False, "-Q", "--quiet", help="不显示进度条"),
     debug: bool = typer.Option(False, "--debug", help="输出调试日志（会自动脱敏 Cookie）"),
     version: bool = typer.Option(False, "--version", help="显示版本后退出"),
+    uninstall: bool = typer.Option(
+        False, "--uninstall", help="卸载 bclaw：删掉程序本体与本机保存的登录态，然后退出"
+    ),
+    assume_yes: bool = typer.Option(
+        False, "-y", "--yes", help="配合 --uninstall：不再询问，直接删"
+    ),
     selftest: bool = typer.Option(
         False,
         "--selftest",
@@ -1021,6 +1031,11 @@ def cli(
             raise typer.Exit()
         typer.echo(f"merge self-check: FAILED: {failure}", err=True)
         raise typer.Exit(int(ExitCode.MISSING_DEPENDENCY))
+
+    if uninstall:
+        # 单独给一个新建的 Console：卸载要问用户一句，而 rich 只有在真正的终端上
+        # 才敢提问（见 `_can_prompt`），这里的判断必须基于面向用户的那个流。
+        raise typer.Exit(uninstall_self(Console(), assume_yes=assume_yes))
 
     if not url and not check and not login:
         err_console.print("[red]请提供视频链接，或使用 --check / --login[/red]")
@@ -1074,6 +1089,146 @@ def reproduce_command() -> str:
     return redact(" ".join(["bili-claw", *(shlex.quote(part) for part in sys.argv[1:])]))
 
 
+ALIAS_NAME = "bili-claw"
+
+
+def installed_binary() -> Path | None:
+    """当前正在运行的可执行文件；从源码运行时返回 ``None``。
+
+    PyInstaller 的单文件产物里 ``sys.executable`` 就是指用户敲的那个文件本身
+    （解包出来的临时目录在 ``sys._MEIPASS`` 里），所以它就是"到底装进去了什么"
+    这个问题的准确答案，比去 PATH 上 ``which`` 一个同名命令可靠得多。
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    return Path(sys.executable).resolve()
+
+
+def uninstall_targets(binary: Path) -> list[Path]:
+    """列出卸载要删的东西，按删除顺序排好。
+
+    顺序有讲究：**程序本体放最后**。Windows 删不掉正在运行的程序，那一条会失败；
+    放在最后，前面几项（登录态、别名软链）一定已经删干净了，用户不会拿到一个
+    "删了三次全失败"的结果。
+    """
+    targets: list[Path] = []
+
+    # 登录态是 `--login` 写下的，里面是能直接冒充用户身份的 Cookie。
+    # 卸载最该带走的就是它——留在机器上而程序已不再存在，最糟糕。
+    cookie_dir = DEFAULT_COOKIE_PATH.parent
+    if cookie_dir.exists():
+        targets.append(cookie_dir)
+
+    alias = binary.with_name(ALIAS_NAME)
+    # 只认指向本程序的软链：`~/.local/bin` 是公共目录，那里的同名文件未必是我们铺的。
+    try:
+        ours = alias.is_symlink() and alias.readlink().name == binary.name
+    except OSError:
+        ours = False
+    if ours:
+        targets.append(alias)
+
+    targets.append(binary)
+    return targets
+
+
+def _describe_target(path: Path) -> str:
+    """给一个待删路径配一句"删的到底是什么"。"""
+    try:
+        if path.is_symlink():
+            return f"软链 → {path.readlink()}"
+        if path.is_dir():
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            return f"目录，{size} 字节（登录态与凭据）"
+        return f"{path.stat().st_size} 字节"
+    except OSError:
+        return ""
+
+
+def uninstall_self(console: Console, *, assume_yes: bool) -> int:
+    """``--uninstall``：把安装脚本铺到机器上的东西收回。
+
+    "一键"省掉的是让用户自己 find + rm 的功夫，不是省掉他知情的权利——所以把每一条
+    都先摆出来再问一句。删除不可撤销，这里不给自己留后悔的余地。
+    """
+    binary = installed_binary()
+    if binary is None:
+        raise UsageError(
+            "这是从源码运行的开发环境，没有装到系统里，没有可卸载的程序",
+            hint="开发环境请直接删掉项目里的 .venv；正式安装走 install.sh / install.ps1",
+        )
+
+    targets = uninstall_targets(binary)
+    console.print("[bold]将要删除[/bold]")
+    for path in targets:
+        console.print(f"  {path}  [dim]{_describe_target(path)}[/dim]")
+    console.print()
+
+    if not assume_yes:
+        if not _can_prompt(console):
+            raise UsageError(
+                "删除前需要确认，但当前不在终端里",
+                hint="确实要在脚本里删，就带上 --yes：bclaw --uninstall --yes",
+            )
+        if Prompt.ask("确认卸载？", choices=["y", "n"], default="n", console=console) != "y":
+            console.print("[yellow]已取消，什么都没删。[/yellow]")
+            return int(ExitCode.OK)
+
+    removed: list[Path] = []
+    failed: list[tuple[Path, str]] = []
+    for path in targets:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            failed.append((path, exc.strerror or str(exc)))
+        else:
+            removed.append(path)
+
+    for path in removed:
+        console.print(f"[green]✓[/green] 已删除 {path}")
+
+    for path, reason in failed:
+        console.print(f"[red]✗[/red] 没删掉 {path}：{reason}")
+
+    # 本体没删掉就别说"已卸载"——那是最容易让用户以为清干净了的一句谎话。
+    if any(path == binary for path, _ in failed):
+        console.print(
+            "  [dim]→ 程序正被占用（Windows 不允许删掉正在运行的程序）。"
+            "关掉这个窗口后手动删掉上面这个文件即可。[/dim]"
+        )
+        return int(ExitCode.FILESYSTEM)
+
+    console.print()
+    console.print("[green]✓[/green] 已卸载 bclaw。")
+    console.print(
+        "  [dim]· 当初若往 shell 配置里加过 `export PATH=…/.local/bin`，那行留着无害，"
+        "想清掉就自己删。[/dim]"
+    )
+    return int(ExitCode.OK)
+
+
+def _print_help() -> None:
+    """按 ``--help`` 的样子把帮助再渲染一遍。
+
+    需求要的是"用法错误时显示 --help 的内容"，那就直接让 typer 自己渲染，而不是另
+    写一份文案——另写的那份迟早会和真实的选项表对不上。
+
+    调用前已确认是用法错误（退出码 2），错误信息 typer 已经打到 stderr 上了，
+    这里只补一份完整帮助。
+    """
+    argv = sys.argv
+    try:
+        sys.argv = [argv[0], "--help"]
+        app()
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = argv
+
+
 def _force_utf8_output() -> None:
     """把 stdout/stderr 钉成 UTF-8。Windows 上这一步是必需的。
 
@@ -1114,6 +1269,13 @@ def main() -> None:
     _force_utf8_output()
     try:
         app()
+    except SystemExit as exc:
+        # 退出码 2 就是"用法错误"——typer/click 的约定与 ExitCode.USAGE 恰好重合。
+        # 错误信息 typer 已经打到 stderr 上了，这里再补一份完整帮助：用户敲错一个
+        # 选项时，最想看的恰恰是"到底有哪些选项"。
+        if exc.code == int(ExitCode.USAGE):
+            _print_help()
+        raise
     except BiliError as exc:
         # 用 Padding 给整块加左缩进：rich 自动折行时，续行才不会顶到第 0 列、
         # 看起来像另一条独立的消息。
