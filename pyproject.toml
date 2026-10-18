@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "biliclaw"
-version = "0.1.1"
+version = "0.1.2"
 description = "哔哩娃娃机 / BiliClaw —— 投币，出爪，把喜欢抓回家。支持清晰度选择的 B站视频下载 CLI"
 readme = "README.md"
 requires-python = ">=3.12"
