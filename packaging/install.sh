@@ -2,7 +2,7 @@
 #
 # BiliClaw 一键安装（macOS / Linux）。
 #
-#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.sh | sh
+#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.1/install.sh | sh
 #
 # **URL 里为什么写死 tag 而不是 /releases/latest？** 因为 latest 那条重定向会跳过
 # 预发布，而验证期发的正是预发布——写 latest 的话，用户敲下第一条命令就吃 404，
@@ -10,7 +10,7 @@
 # 版本转正之后，把 URL 换成 /releases/latest/download/install.sh 即可。
 #
 # 可选环境变量：
-#   BCLAW_VERSION=0.1.0          装指定版本（默认装最新，含预发布）
+#   BCLAW_VERSION=0.1.1          装指定版本（默认装最新，含预发布）
 #   BCLAW_INSTALL_DIR=~/.local/bin   安装到别处
 #
 # **为什么坚持用 curl 而不是让用户去浏览器下载？**

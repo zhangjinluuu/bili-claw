@@ -34,13 +34,13 @@ $ bclaw BV17wpp6SEe9 -q 1080
 
 ```bash
 # macOS（Apple 芯片）与 Linux（x64）
-curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.sh | sh
+curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.1/install.sh | sh
 ```
 
 Windows（PowerShell）：
 
 ```powershell
-irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.ps1 | iex
+irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.1/install.ps1 | iex
 ```
 
 验证环境：
@@ -49,12 +49,12 @@ irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.0/install.p
 bclaw --check
 ```
 
-> **URL 里为什么写死了 `v0.1.0` 而不是用 `/releases/latest`？** 因为 `latest` 会跳过
+> **URL 里为什么写死了 `v0.1.1` 而不是用 `/releases/latest`？** 因为 `latest` 会跳过
 > **预发布**，而目前发布的正是预发布（三平台的真实安装还没逐个验过）。写 `latest`
 > 的话你敲下第一条命令就是 404，而且报错信息看起来跟「这个项目还没发版」一模一样。
-> 版本转正后，把 URL 里的 `releases/download/v0.1.0` 换成 `releases/latest/download` 即可。
+> 版本转正后，把 URL 里的 `releases/download/v0.1.1` 换成 `releases/latest/download` 即可。
 >
-> 想装别的版本就改 URL 里的 tag，或者装完直接用 `BCLAW_VERSION=0.1.0` 环境变量指定。
+> 想装别的版本就改 URL 里的 tag，或者装完直接用 `BCLAW_VERSION=0.1.1` 环境变量指定。
 
 > **为什么用 `curl` 而不是去 Release 页面点下载？** 这不是风格偏好。浏览器下载的文件会被打上
 > 隔离标记（macOS 的 `com.apple.quarantine`、Windows 的 Mark-of-the-Web），于是 macOS 报
