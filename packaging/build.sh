@@ -170,6 +170,25 @@ step "artifact built: ${BIN} ${SIZE} bytes"
 echo "▸ 冒烟测试"
 "$BIN" --version >/dev/null || fail "产物无法启动：${BIN} --version 非零退出"
 
+# `--help` 是**另一条独立代码路径**：它把整条 rich 渲染链拉进来
+#（typer.rich_utils → rich.markdown → rich.syntax → pygments）。这条链平时一次都不走，
+# 而 spec 的 EXCLUDES 里曾经列着 pygments（理由"我们的输出没有代码高亮，省 5 MB"），
+# 于是产物一敲 `--help` 就是：
+#
+#     ModuleNotFoundError: No module named 'pygments'
+#     [PYI-39881:ERROR] Failed to execute script 'entry' due to unhandled exception!
+#
+# 而 `--version` 一切正常——这正是它能一路混进已发布产物的原因：冒烟测试当时只测了
+# `--version` 和 `--selftest`，两条都不碰 rich 的渲染。这里补上守门人。
+if ! HELP_OUT="$("$BIN" --help 2>&1)"; then
+    echo "$HELP_OUT" >&2
+    fail "产物打不出 --help：$(printf '%s' "$HELP_OUT" | tr -d '\r' | head -n 3 | tr '\n' ' ')"
+fi
+# 只看退出码不够：真正想拦的是"退出码 0、帮助却是空的"那种安静的成功。
+if ! printf '%s' "$HELP_OUT" | grep -q "Usage:"; then
+    fail "产物 --help 没打出用法：$(printf '%s' "$HELP_OUT" | tr -d '\r' | head -n 2 | tr '\n' ' ')"
+fi
+
 # 再用 cp1252 逼一次**输出编码**路径。
 #
 # 这不是随便挑的编码：Windows 上 stdout 被重定向（CI 就是管道）时，Python 用

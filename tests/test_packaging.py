@@ -353,6 +353,25 @@ def test_build_smoke_test_forces_a_non_utf8_encoding() -> None:
     assert 'grep -q "bili-claw"' in text, "还要确认 cp1252 下真的打出了内容"
 
 
+def test_build_smoke_test_runs_help() -> None:
+    """冒烟测试必须跑一次 `--help`——那是唯一会碰 rich 渲染链的一条路。
+
+    typer 只在**真要渲染帮助**时才 import `rich_utils`，而 `rich.syntax` 在模块顶层
+    就 `from pygments.lexer import Lexer`。spec 的 EXCLUDES 里曾经列着 pygments，
+    理由是"我们的输出没有代码高亮，省 5 MB"；排掉之后冻结产物一敲 `--help` 就是：
+
+        ModuleNotFoundError: No module named 'pygments'
+        [PYI-39881:ERROR] Failed to execute script 'entry' due to unhandled exception!
+
+    而 `--version` 与 `--selftest` 全都正常——冒烟测试当时只测了这两条，于是这个坑
+    一路躺进了已发布的产物里。这条守卫保证以后不会再把唯一会走渲染链的用例删掉。
+    """
+    text = _strip_comments((PACKAGING / "build.sh").read_text(encoding="utf-8"))
+    assert '"$BIN" --help' in text, "冒烟测试要跑一次 --help"
+    # 只看退出码不够：真正要拦的是"退出码 0、帮助却是空的"那种安静的成功。
+    assert 'grep -q "Usage:"' in text, "还要确认帮助真的打出了用法"
+
+
 def test_every_curl_call_can_stop_waiting() -> None:
     """`install.sh` 里的每条 curl 都必须能自己停下来。
 

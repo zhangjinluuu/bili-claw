@@ -48,9 +48,16 @@ EXCLUDES = [
     "pip",
     "wheel",
     "PyInstaller",
-    # rich 只在 rich.syntax 里用到 pygments，而我们的输出没有代码高亮；
-    # 它是整棵依赖树里除标准库外最大的一块（约 5 MB），值得单独排掉
-    "pygments",
+    # **不要**把 pygments 排掉。这里曾经列着它，理由是"我们的输出没有代码高亮，
+    # 省 5 MB"。但 `--help` 走的是 rich 的帮助渲染链
+    # typer.rich_utils → rich.markdown → rich.syntax，而 rich.syntax 在模块顶层
+    # 就 `from pygments.lexer import Lexer`。排掉它之后，冻结产物一敲 `--help` 就是
+    #
+    #     ModuleNotFoundError: No module named 'pygments'
+    #     [PYI-39881:ERROR] Failed to execute script 'entry' due to unhandled exception!
+    #
+    # 而 `--version` 一直正常——冒烟测试当年只测了 `--version`，这个坑就一路躺到了
+    # 已发布的产物里。`packaging/build.sh` 现在会跑一次 `--help` 兜底。
     # 平台分支：macOS 产物里不该出现 Windows/Linux 的浏览器支持代码
     "win32ctypes",
     "readline",
