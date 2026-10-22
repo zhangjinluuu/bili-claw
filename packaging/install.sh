@@ -2,7 +2,7 @@
 #
 # BiliClaw 一键安装（macOS / Linux）。
 #
-#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.2/install.sh | sh
+#   curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.sh | sh
 #
 # **URL 里为什么写死 tag 而不是 /releases/latest？** 因为 latest 那条重定向会跳过
 # 预发布，而验证期发的正是预发布——写 latest 的话，用户敲下第一条命令就吃 404，
@@ -10,8 +10,12 @@
 # 版本转正之后，把 URL 换成 /releases/latest/download/install.sh 即可。
 #
 # 可选环境变量：
-#   BCLAW_VERSION=0.1.2          装指定版本（默认装最新，含预发布）
+#   BCLAW_VERSION=0.1.3          装指定版本（默认装最新，含预发布）
 #   BCLAW_INSTALL_DIR=~/.local/bin   安装到别处
+#   BCLAW_MIRROR=https://gh-proxy.com   国内镜像：在产物 URL 前拼上它
+#       GitHub Releases 在国内常常只有几十 KB/s，20 MB 的包要下十几分钟。
+#       镜像只代理 github.com 的下载路径，**不代理 api.github.com 的版本查询**；
+#       所以网络差到连 API 都拿不到 tag 时，还得同时给 BCLAW_VERSION。
 #
 # **为什么坚持用 curl 而不是让用户去浏览器下载？**
 # 这不是风格偏好。浏览器下载的文件会被打上隔离标记（macOS 的 com.apple.quarantine），
@@ -24,6 +28,8 @@ set -eu
 REPO="zhangjinluuu/bili-claw"
 INSTALL_DIR="${BCLAW_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${BCLAW_VERSION:-}"
+#: 国内镜像前缀，形如 ``https://gh-proxy.com``。空表示直连。
+MIRROR="${BCLAW_MIRROR:-}"
 
 die() {
     printf '✗ %s\n' "$1" >&2
@@ -71,7 +77,20 @@ else
     URL="https://github.com/${REPO}/releases/latest/download/${ARCHIVE}"
 fi
 
+# 镜像就是在完整 URL 前面拼一个前缀（gh-proxy 系的约定：`<镜像>/<原始 URL>`）。
+# 末尾斜杠可有可无，这里统一去掉，免得拼出双斜杠再被镜像判成另一个路径。
+if [ -n "$MIRROR" ]; then
+    URL="${MIRROR%/}/${URL}"
+fi
+
 printf '▸ 平台：%s-%s\n▸ 版本：%s\n' "$OS_TAG" "$ARCH_TAG" "${VERSION:-latest}"
+if [ -n "$MIRROR" ]; then
+    printf '▸ 镜像：%s\n' "$MIRROR"
+elif [ -z "$VERSION" ]; then
+    printf '  [提示] 没拿到版本号，走的是 latest 重定向；预发布版本会 404。\n' >&2
+    printf '  [提示] 国内网络：在脚本 URL 前加镜像前缀，并把版本号显式给上\n' >&2
+    printf '         （镜像只代理下载路径，取不到版本号）。具体命令见 README。\n' >&2
+fi
 
 # --- 下载并解压 -------------------------------------------------------------
 # 解到临时目录再搬过去：中途失败时不会在安装目录里留下半个二进制，
@@ -86,15 +105,35 @@ printf '▸ 下载 %s\n' "$URL"
 #                         TCP 直接黑洞），症状就是「敲完命令后终端一片空白」。
 #   --retry 3             链路抖动很常见，重试三次比让用户自己重跑整个脚本便宜。
 #   --progress-bar        静默模式下 18MB 的下载和「卡死」在用户眼里没有区别。
-if ! curl -fL --connect-timeout 10 --retry 3 --retry-delay 2 --progress-bar \
-        "$URL" -o "$TMP/$ARCHIVE"; then
-    printf '\n' >&2
-    die "下载失败：$URL
+#
+# 外面再套一层断点续传：镜像和运营商常在长连接上降速甚至断流，20 MB 从断点续上比
+# 重新下一遍便宜得多。只有文件已经有内容时才加 `-C -`——空文件上用它，行为取决于
+# curl 版本，不值得赌。
+attempt=0
+while :; do
+    if [ -s "$TMP/$ARCHIVE" ]; then
+        curl -fL -C - --connect-timeout 10 --retry 2 --retry-delay 2 --progress-bar \
+            "$URL" -o "$TMP/$ARCHIVE" && break
+    else
+        curl -fL --connect-timeout 10 --retry 2 --retry-delay 2 --progress-bar \
+            "$URL" -o "$TMP/$ARCHIVE" && break
+    fi
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 5 ]; then
+        printf '\n' >&2
+        die "下载失败：${URL}（已重试 5 次）
     1) 连不上 github.com —— 换网络，或先设代理再重跑：
          export https_proxy=http://127.0.0.1:7890
-    2) 这个版本没挂 $ARCHIVE —— 用 BCLAW_VERSION=<已发布的版本> 指定
-    3) 想手动装：浏览器打开上面的 URL，解开后把 bclaw 放进 $INSTALL_DIR"
-fi
+    2) 国内网络太慢 —— 改用镜像重跑（推荐，本机实测快 5 倍以上）：
+         把本脚本的 URL 前面加上镜像前缀（gh-proxy 系的约定：<镜像>/<原始 URL>），
+         并同时给出 BCLAW_VERSION 与 BCLAW_MIRROR 两个环境变量，
+         因为镜像只代理下载路径，取不到版本号。完整命令见 README「国内加速」一节。
+    3) 这个版本没挂 $ARCHIVE —— 用 BCLAW_VERSION=<已发布的版本> 指定
+    4) 想手动装：用镜像前缀打开上面的 URL，解开后把 bclaw 放进 $INSTALL_DIR"
+    fi
+    printf '  %s\n' "[重试 $attempt/5] 已收 $(wc -c <"$TMP/$ARCHIVE" 2>/dev/null || echo 0) 字节，接着下…" >&2
+    sleep 2
+done
 
 tar xzf "$TMP/$ARCHIVE" -C "$TMP" || die "解压失败，下载到的可能不是一个 tar.gz"
 

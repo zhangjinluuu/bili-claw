@@ -3,15 +3,16 @@
     BiliClaw 一键安装（Windows）。
 
 .EXAMPLE
-    irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.2/install.ps1 | iex
+    irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.ps1 | iex
 
     URL 里写死 tag 而不是用 /releases/latest：latest 那条重定向会跳过预发布，
     而验证期发的正是预发布，写 latest 会让用户的第一条命令直接 404，连脚本都拿不到。
     版本转正后换成 /releases/latest/download/install.ps1 即可。
 
     因为整条命令是一行，参数只能靠环境变量传：
-        $env:BCLAW_VERSION = "0.1.2"          # 装指定版本（默认装最新，含预发布）
+        $env:BCLAW_VERSION = "0.1.3"          # 装指定版本（默认装最新，含预发布）
         $env:BCLAW_INSTALL_DIR = "$HOME\bin"  # 装到别处
+        $env:BCLAW_MIRROR = "https://gh-proxy.com"  # 国内镜像：加速产物下载
 
 .NOTES
     用 `irm | iex` 而不是「下载 zip 再解压」是有意的：浏览器或资源管理器下载的
@@ -26,6 +27,8 @@ $ErrorActionPreference = 'Stop'
 $Repo       = 'zhangjinluuu/bili-claw'
 $InstallDir = if ($env:BCLAW_INSTALL_DIR) { $env:BCLAW_INSTALL_DIR } else { "$HOME\bin" }
 $Version    = $env:BCLAW_VERSION
+# 国内镜像前缀，形如 https://gh-proxy.com。空表示直连。
+$Mirror     = $env:BCLAW_MIRROR
 
 function Fail($Message) {
     Write-Host "✗ $Message" -ForegroundColor Red
@@ -62,6 +65,11 @@ $Url = if ($Version) {
     "https://github.com/$Repo/releases/latest/download/$Archive"
 }
 
+# 镜像就是在完整 URL 前面拼一个前缀（gh-proxy 系的约定：<镜像>/<原始 URL>）。
+if ($Mirror) {
+    $Url = "$($Mirror.TrimEnd('/'))/$Url"
+}
+
 Write-Host "▸ 平台：windows-$Arch"
 Write-Host "▸ 版本：$(if ($Version) { $Version } else { 'latest' })"
 
@@ -77,7 +85,10 @@ try {
     try {
         Invoke-WebRequest -Uri $Url -OutFile $Zip -UseBasicParsing
     } catch {
-        Fail "下载失败。若这是首次发布，请确认 $Archive 已挂在该版本的 Release 上。"
+        Fail ("下载失败：$Url`n"
+            + "  1) 网络不通：检查代理或换网络`n"
+            + "  2) 国内网络太慢：设 `$env:BCLAW_MIRROR = 'https://gh-proxy.com' 后重跑`n"
+            + "  3) 该版本没挂 $Archive：用 `$env:BCLAW_VERSION 指定一个已发布的版本")
     }
 
     Expand-Archive -Path $Zip -DestinationPath $Tmp -Force

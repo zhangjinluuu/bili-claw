@@ -12,6 +12,7 @@ ubuntu-latest"这类反面教材，不剥的话每一条断言都会被自己的
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -404,3 +405,121 @@ def test_every_curl_call_can_stop_waiting() -> None:
     assert all("--progress-bar" in line for line in download), (
         "下载 18MB 的那条 curl 必须显示进度：静默模式下『正在下载』和『卡死』在用户眼里没区别"
     )
+
+
+# --- 安装脚本的下载路径（真的跑一遍，而不是读正则）-------------------------------
+#
+# 下面两个用例不读源码，而是造一个假 `curl` 把安装脚本完整执行一次。理由是这两件事
+# 都出过事、而且都是"看着对、跑起来错"的类型：镜像前缀是字符串拼出来的，续传参数是
+# 有条件加的。用正则断言"文件里出现过 BCLAW_MIRROR"证明不了用户那条命令会走镜像。
+
+
+def _fake_release_bundle(dest: Path) -> Path:
+    """造一个里面只有一个 `bclaw` 的 tar.gz，冒充 Release 资产。"""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        payload = b"#!/bin/sh\necho 'bili-claw 9.9.9 fake'\n"
+        info = tarfile.TarInfo("bclaw")
+        info.size = len(payload)
+        info.mode = 0o755
+        tf.addfile(info, io.BytesIO(payload))
+    dest.write_bytes(buf.getvalue())
+    return dest
+
+
+def _fake_curl(bin_dir: Path, *, fail_times: int = 0) -> Path:
+    """一个只会记参数、把预置 tarball 拷到 `-o` 位置的假 curl。
+
+    `fail_times` 大于 0 时前几次故意失败并留下一个残片，用来模拟长连接断流。
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+        'out=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        "n=$(wc -l < \"$CURL_LOG\" | tr -d ' ')\n"
+        f'if [ "$n" -le {fail_times} ]; then\n'
+        '  [ -n "$out" ] && head -c 100 "$FAKE_TARBALL" > "$out"\n'
+        "  exit 18\n"
+        "fi\n"
+        '[ -n "$out" ] && cp "$FAKE_TARBALL" "$out"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    return curl
+
+
+def _run_installer(tmp_path: Path, curl: Path, extra_env: dict[str, str]) -> tuple[Path, list[str]]:
+    log = tmp_path / "curl.log"
+    log.write_text("", encoding="utf-8")
+    install_dir = tmp_path / "install"
+    env = {
+        **os.environ,
+        "PATH": f"{curl.parent}:{os.environ['PATH']}",
+        "BCLAW_INSTALL_DIR": str(install_dir),
+        "CURL_LOG": str(log),
+        "FAKE_TARBALL": str(tmp_path / "fake.tar.gz"),
+        **extra_env,
+    }
+    subprocess.run(
+        ["sh", str(PACKAGING / "install.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    return install_dir, log.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="install.sh 是 POSIX 脚本，Windows 走 install.ps1")
+def test_installer_can_use_a_domestic_mirror(tmp_path: Path) -> None:
+    """`BCLAW_MIRROR` 必须真的把产物下载改道到镜像。
+
+    国内直连 `github.com` 拉 18MB 的包实测约 35 KB/s，十几分钟；镜像能到 170 KB/s 以上。
+    镜像的约定是"在完整 URL 前面拼前缀"（`<镜像>/https://github.com/...`），拼错了用户
+    只会看到"下载失败"，然后以为镜像本身不可用。
+    """
+    _fake_release_bundle(tmp_path / "fake.tar.gz")
+    curl = _fake_curl(tmp_path / "bin")
+    install_dir, calls = _run_installer(
+        tmp_path,
+        curl,
+        {"BCLAW_VERSION": "v9.9.9", "BCLAW_MIRROR": "https://gh-proxy.com"},
+    )
+
+    fetches = [line for line in calls if "http" in line]
+    assert fetches, "假 curl 一次都没被调用——安装脚本改走别的下载器了？"
+    assert (
+        "https://gh-proxy.com/https://github.com/zhangjinluuu/bili-claw/releases/download/v9.9.9/"
+        in fetches[0]
+    ), f"镜像没生效，实际请求的是：{fetches[0]}"
+    assert (install_dir / "bclaw").exists(), "镜像下载的包没有被安装"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="install.sh 是 POSIX 脚本，Windows 走 install.ps1")
+def test_installer_resumes_a_dropped_download(tmp_path: Path) -> None:
+    """断流之后必须从断点续上，而不是把这十几分钟重新走一遍。
+
+    镜像和运营商常在长连接上降速、断流。20MB 从断点续上几乎不要钱，重新下一遍要十分钟。
+    第一次请求不能带 `-C -`（空文件上的行为依赖 curl 版本），之后每次都要带。
+    """
+    _fake_release_bundle(tmp_path / "fake.tar.gz")
+    curl = _fake_curl(tmp_path / "bin", fail_times=2)
+    install_dir, calls = _run_installer(
+        tmp_path,
+        curl,
+        {"BCLAW_VERSION": "v9.9.9"},
+    )
+
+    fetches = [line for line in calls if "http" in line]
+    assert len(fetches) >= 3, f"断流两次之后应该重试到第三次，实际只请求了 {len(fetches)} 次"
+    assert "-C -" not in fetches[0], "第一次请求就带 -C -：此时输出文件还不存在，行为依赖 curl 版本"
+    assert all("-C -" in line for line in fetches[1:]), "重试时必须续传，否则等于把这十几分钟重走一遍"
+    assert (install_dir / "bclaw").exists(), "续传没有走到安装完成"

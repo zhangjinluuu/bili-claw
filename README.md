@@ -35,13 +35,13 @@ $ bclaw BV17wpp6SEe9 -q 1080
 
 ```bash
 # macOS（Apple 芯片）与 Linux（x64）
-curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.2/install.sh | sh
+curl -fsSL https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.sh | sh
 ```
 
 Windows（PowerShell）：
 
 ```powershell
-irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.2/install.ps1 | iex
+irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.ps1 | iex
 ```
 
 验证环境：
@@ -50,17 +50,49 @@ irm https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.2/install.p
 bclaw --check
 ```
 
-> **URL 里为什么写死了 `v0.1.2` 而不是用 `/releases/latest`？** 因为 `latest` 会跳过
+> **URL 里为什么写死了 `v0.1.3` 而不是用 `/releases/latest`？** 因为 `latest` 会跳过
 > **预发布**，而目前发布的正是预发布（三平台的真实安装还没逐个验过）。写 `latest`
 > 的话你敲下第一条命令就是 404，而且报错信息看起来跟「这个项目还没发版」一模一样。
-> 版本转正后，把 URL 里的 `releases/download/v0.1.2` 换成 `releases/latest/download` 即可。
+> 版本转正后，把 URL 里的 `releases/download/v0.1.3` 换成 `releases/latest/download` 即可。
 >
-> 想装别的版本就改 URL 里的 tag，或者装完直接用 `BCLAW_VERSION=0.1.2` 环境变量指定。
+> 想装别的版本就改 URL 里的 tag，或者装完直接用 `BCLAW_VERSION=0.1.3` 环境变量指定。
 
 > **为什么用 `curl` 而不是去 Release 页面点下载？** 这不是风格偏好。浏览器下载的文件会被打上
 > 隔离标记（macOS 的 `com.apple.quarantine`、Windows 的 Mark-of-the-Web），于是 macOS 报
 > 「已损坏，无法打开」、Windows 弹 SmartScreen 警告。用命令行工具下载**不产生这个标记**，
 > 等于绕过了代码签名问题——而正式解决它需要一年 $99 的 Apple 开发者账号。
+
+### 国内网络：换镜像
+
+直连 `github.com` 在国内经常只有几十 KB/s，18 MB 的包要十几分钟。把 URL 前面加一个镜像
+前缀就行，命令其余部分不变：
+
+```bash
+MIRROR=https://gh-proxy.com
+TAG=v0.1.3
+curl -fsSL "$MIRROR/https://github.com/zhangjinluuu/bili-claw/releases/download/$TAG/install.sh" \
+  | BCLAW_VERSION=$TAG BCLAW_MIRROR=$MIRROR sh
+```
+
+Windows：
+
+```powershell
+$env:BCLAW_VERSION = "v0.1.3"
+$env:BCLAW_MIRROR  = "https://gh-proxy.com"
+irm https://gh-proxy.com/https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.ps1 | iex
+```
+
+三点须知：
+
+1. **前缀拼在完整 URL 前面**（`<镜像>/https://github.com/...`），这是 gh-proxy 系列的约定。
+2. **`BCLAW_VERSION` 要自己给**。脚本正常靠 GitHub API 查最新版本，但走镜像时这条查询
+   常常落到 `latest` 重定向，而 `latest` 会跳过预发布——结果就是 404。显式给版本就绕开了。
+3. **断流会自动续传**。`install.sh` 用 `curl -C -` 从断点接着下，最多重试 5 次，
+   所以镜像中途降速不用把命令重敲一遍。
+
+镜像站点会失效，可以换 `https://gh-proxy.com`、`https://ghproxy.net`、`https://gh-proxy.org`、
+`https://ghfast.top` 逐个试。实测 `gh-proxy.com` 表现最好（约 170 KB/s），
+`ghproxy.net` 不到 1 KB/s。
 
 <details>
 <summary>从源码安装（开发用）</summary>
