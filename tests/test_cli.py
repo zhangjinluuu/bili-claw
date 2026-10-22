@@ -590,3 +590,140 @@ def test_a_domain_exit_never_prints_the_help(monkeypatch: pytest.MonkeyPatch) ->
 
     assert info.value.code == int(ExitCode.USAGE)
     assert printed == []
+
+
+# --------------------------------------------------------------------------- #
+# `--logout`
+# --------------------------------------------------------------------------- #
+
+
+def _login_state(tmp_path: Path) -> tuple[Path, Path]:
+    """铺一份「新路径 + 改名前的旧路径」都存在的登录态。"""
+    current = tmp_path / ".biliclaw" / "cookies.txt"
+    current.parent.mkdir()
+    current.write_text("SESSDATA=secret", encoding="utf-8")
+    legacy = tmp_path / ".bilidl" / "cookies.txt"
+    legacy.parent.mkdir()
+    legacy.write_text("SESSDATA=older-secret", encoding="utf-8")
+    return current, legacy
+
+
+def test_logout_removes_the_saved_login_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """登出把凭据带走，程序留着。"""
+    current, legacy = _login_state(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", current)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", legacy)
+        patch.setattr(cli, "env_cookie_names", lambda: [])
+        patch.setattr(sys, "argv", ["bclaw", "--logout"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.OK)
+    assert not current.exists()
+    assert "已登出" in capsys.readouterr().out
+
+
+def test_logout_also_takes_the_legacy_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只删新路径会留下一个假登出。
+
+    `resolve_cookie` 在新路径不存在时会回退到改名前的 `~/.bilidl`——只删新的那份，
+    用户以为登出了，下一次下载却仍然带着旧凭据。
+    """
+    current, legacy = _login_state(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", current)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", legacy)
+        patch.setattr(cli, "env_cookie_names", lambda: [])
+        patch.setattr(sys, "argv", ["bclaw", "--logout"])
+        with pytest.raises(SystemExit):
+            main()
+
+    assert not current.exists()
+    assert not legacy.exists()
+
+
+def test_logout_says_so_when_there_is_nothing_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """已经登出过再登出一次，不是错误——否则脚本里连跑两次就莫名失败了。"""
+    missing = tmp_path / ".biliclaw" / "cookies.txt"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", missing)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", tmp_path / ".bilidl" / "cookies.txt")
+        patch.setattr(cli, "env_cookie_names", lambda: [])
+        patch.setattr(sys, "argv", ["bclaw", "--logout"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.OK)
+    assert "没有保存的登录态" in capsys.readouterr().out
+
+
+def test_logout_warns_that_environment_variables_win(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """文件删了、环境变量还设着，下载仍然带着登录态——不说清楚就是骗人。"""
+    current, legacy = _login_state(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", current)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", legacy)
+        patch.setattr(cli, "env_cookie_names", lambda: ["BILICLAW_SESSDATA"])
+        patch.setattr(sys, "argv", ["bclaw", "--logout"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.OK)
+    text = capsys.readouterr().out
+    assert "BILICLAW_SESSDATA" in text
+    assert "unset" in text
+
+
+def test_logout_never_claims_success_when_the_file_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """删不掉就报删不掉——留着的那份仍是完整可用的身份凭据。"""
+    current, legacy = _login_state(tmp_path)
+
+    def _deny(self: Path) -> None:
+        raise PermissionError(13, "Operation not permitted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", current)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", legacy)
+        patch.setattr(cli, "env_cookie_names", lambda: [])
+        patch.setattr(Path, "unlink", _deny)
+        patch.setattr(sys, "argv", ["bclaw", "--logout"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.FILESYSTEM)
+    text = capsys.readouterr().out
+    assert "没删掉" in text
+    assert "已登出" not in text
+
+
+def test_logout_refuses_to_run_alongside_a_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`bclaw <URL> --logout` 只有一个合理解释：用户以为它会先下载再登出。"""
+    current, legacy = _login_state(tmp_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "DEFAULT_COOKIE_PATH", current)
+        patch.setattr(cli, "LEGACY_COOKIE_PATH", legacy)
+        patch.setattr(sys, "argv", ["bclaw", "BV1xx411c7mD", "--logout"])
+        with pytest.raises(SystemExit) as caught:
+            main()
+
+    assert caught.value.code == int(ExitCode.USAGE)
+    assert current.exists()
+    assert "独立动作" in capsys.readouterr().err

@@ -212,5 +212,15 @@ def is_logged_in(cookies: dict[str, str]) -> bool:
     return bool(cookies.get(SESSDATA_KEY, "").strip())
 
 
+def env_cookie_names() -> list[str]:
+    """当前环境里**确实设了值**的 Cookie 环境变量名。
+
+    `--logout` 用它来说清一件事：删掉 Cookie 文件不等于登出。环境变量在
+    :func:`resolve_cookie` 里的优先级比文件高，只要它还设着，下一次下载照样带着
+    这份凭据跑——用户会以为自己已经登出，其实没有。
+    """
+    return [name for name in _ENV_NAMES if os.environ.get(name)]
+
+
 def cookie_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{name}={value}" for name, value in cookies.items())

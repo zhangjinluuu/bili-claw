@@ -8,6 +8,7 @@ FR-05 合并、FR-07 命名、FR-09 登录态、FR-11 进度与退出码、FR-12
 用法示例::
 
     bclaw --login                                  # 一键从浏览器取登录态（推荐先跑这个）
+    bclaw --logout                                 # 退出登录：只删凭据，程序留着
     bili-claw "https://www.bilibili.com/video/BV1xx411c7mD"
     bclaw BV1xx411c7mD -q 720
     bclaw <URL> -q 1080 --cookie-file ~/bili-cookies.txt
@@ -38,7 +39,14 @@ from rich.text import Text
 
 from . import __version__, browser, qrlogin, quality
 from .api import BiliClient
-from .cookies import DEFAULT_COOKIE_PATH, is_logged_in, redact, resolve_cookie
+from .cookies import (
+    DEFAULT_COOKIE_PATH,
+    LEGACY_COOKIE_PATH,
+    env_cookie_names,
+    is_logged_in,
+    redact,
+    resolve_cookie,
+)
 from .downloader import DEFAULT_CONCURRENCY, StreamDownloader, parse_rate
 from .errors import (
     AuthError,
@@ -1092,6 +1100,9 @@ def cli(
     uninstall: bool = typer.Option(
         False, "--uninstall", help="卸载 bclaw：删掉程序本体与本机保存的登录态，然后退出"
     ),
+    logout: bool = typer.Option(
+        False, "--logout", help="登出：只删掉本机保存的登录态，保留程序"
+    ),
     assume_yes: bool = typer.Option(
         False, "-y", "--yes", help="配合 --uninstall：不再询问，直接删"
     ),
@@ -1127,6 +1138,16 @@ def cli(
         # 单独给一个新建的 Console：卸载要问用户一句，而 rich 只有在真正的终端上
         # 才敢提问（见 `_can_prompt`），这里的判断必须基于面向用户的那个流。
         raise typer.Exit(uninstall_self(Console(), assume_yes=assume_yes))
+
+    if logout:
+        # 登出是第一人称的一次动作，不接受"顺便下载"。真有人这么写，多半是以为
+        # 它会先用旧账号下一遍再登出——不如直说。
+        if login or url:
+            raise UsageError(
+                "--logout 是独立动作，不接受视频链接或 --login",
+                hint="要退出登录：先跑 bclaw --logout；之后的下载自然就是匿名身份了",
+            )
+        raise typer.Exit(logout_saved(Console(), cookie_file=cookie_file))
 
     # 单独一个 --qrcode 什么也不做：它是 --login 的取凭据方式，不是独立命令。
     # 不说清楚的话，用户看到的是「请提供视频链接」——那和扫码毫无关系。
@@ -1244,6 +1265,87 @@ def _describe_target(path: Path) -> str:
         return ""
 
 
+def login_state_files(explicit: Path | None) -> list[Path]:
+    """列出 ``--logout`` 要删的凭据文件。
+
+    **两个默认路径都要算。** :func:`resolve_cookie` 在新路径不存在时会回退到老路径
+    （改名前的 ``~/.bilidl``），只删新的，用户会以为自己登出了，下一次下载却仍然
+    带着旧的登录态——"登出没生效"最难查的那种。
+    """
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend((DEFAULT_COOKIE_PATH, LEGACY_COOKIE_PATH))
+
+    found: list[Path] = []
+    for path in candidates:
+        # 用 is_file 而不是 exists：目录同名的东西不是我们要删的凭据文件。
+        if path.is_file() and path not in found:
+            found.append(path)
+    return found
+
+
+def _describe_cookie_file(path: Path) -> str:
+    """给一个凭据文件配一句"删的是什么、什么时候留下的"。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+    return f"{stat.st_size} 字节，写入于 {stamp}"
+
+
+def logout_saved(console: Console, *, cookie_file: Path | None) -> int:
+    """``--logout``：把本机保存的登录态删掉，**程序留着**。
+
+    与 ``--uninstall`` 的分工：那个删程序，这个只删凭据。两者都碰同一个文件，但
+    "我不想让你再用我的账号"和"我不想要这个程序"是两件独立的事——只提供后者的话，
+    想退出登录的人只能卸载重装。
+
+    删之前不再问一句：命令本身就叫"登出"，它只有一种解释，而误删的代价是重新登录
+    一次。:func:`uninstall_self` 之所以要确认，是因为那边删掉的东西装不回来。
+    """
+    targets = login_state_files(cookie_file)
+    if not targets:
+        console.print("[green]✓[/green] 当前没有保存的登录态，不需要登出")
+        console.print("[dim]下载会以匿名身份进行，最高 480P；要登录就跑 bclaw --login[/dim]")
+        return int(ExitCode.OK)
+
+    console.print("[bold]将要删除[/bold]")
+    for path in targets:
+        console.print(f"  {path}  [dim]{_describe_cookie_file(path)}[/dim]", soft_wrap=True)
+    console.print()
+
+    failed: list[tuple[Path, str]] = []
+    for path in targets:
+        try:
+            path.unlink()
+        except OSError as exc:
+            failed.append((path, exc.strerror or str(exc)))
+        else:
+            console.print(f"[green]✓[/green] 已删除 {path}", soft_wrap=True)
+
+    if failed:
+        # 一处没删掉就不能报"已登出"：留着的那份仍然是完整可用的身份凭据。
+        for path, reason in failed:
+            console.print(f"[red]☒ 没删掉 {path}：{reason}[/red]", soft_wrap=True)
+        console.print("[yellow]登录态可能还在，下次下载前请确认一下。[/yellow]")
+        return int(ExitCode.FILESYSTEM)
+
+    console.print("[green]✓ 已登出[/green]：下载会以匿名身份进行，最高 480P")
+    console.print("[dim]想重新登录：bclaw --login（或 bclaw --login --qrcode 扫码）[/dim]")
+
+    still_set = env_cookie_names()
+    if still_set:
+        # 文件删了但环境变量还设着，下一次下载仍然带着登录态跑。
+        console.print(
+            f"[yellow]注意：环境变量 {'、'.join(still_set)} 还在，"
+            f"它比文件优先，下载时仍会带上这份凭据[/yellow]"
+        )
+        console.print(f"[dim]要彻底登出，先在 shell 里 unset {' '.join(still_set)}[/dim]")
+    return int(ExitCode.OK)
+
+
 def uninstall_self(console: Console, *, assume_yes: bool) -> int:
     """``--uninstall``：把安装脚本铺到机器上的东西收回。
 
@@ -1260,7 +1362,8 @@ def uninstall_self(console: Console, *, assume_yes: bool) -> int:
     targets = uninstall_targets(binary)
     console.print("[bold]将要删除[/bold]")
     for path in targets:
-        console.print(f"  {path}  [dim]{_describe_target(path)}[/dim]")
+        # soft_wrap：路径是拿来复制粘贴的，被 rich 折成两行就废了。
+        console.print(f"  {path}  [dim]{_describe_target(path)}[/dim]", soft_wrap=True)
     console.print()
 
     if not assume_yes:
