@@ -523,3 +523,26 @@ def test_installer_resumes_a_dropped_download(tmp_path: Path) -> None:
     assert "-C -" not in fetches[0], "第一次请求就带 -C -：此时输出文件还不存在，行为依赖 curl 版本"
     assert all("-C -" in line for line in fetches[1:]), "重试时必须续传，否则等于把这十几分钟重走一遍"
     assert (install_dir / "bclaw").exists(), "续传没有走到安装完成"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="install.sh 是 POSIX 脚本，Windows 走 install.ps1")
+def test_installer_accepts_a_version_with_or_without_v(tmp_path: Path) -> None:
+    """`BCLAW_VERSION` 带不带 `v` 都得能用。
+
+    tag 是 `v0.1.3`，而脚本头部注释和 README 里都写成 `BCLAW_VERSION=0.1.3`（不带 v）。
+    少了归一化，URL 就变成 `/releases/download/0.1.3/`——一个 404，而那条报错长得
+    很像「这个版本没发布」，于是用户会去翻 Release 页面，那里明明挂着这个版本。
+    """
+    for typed in ("0.1.3", "v0.1.3"):
+        case = tmp_path / typed
+        case.mkdir()
+        _fake_release_bundle(case / "fake.tar.gz")
+        curl = _fake_curl(case / "bin")
+        install_dir, calls = _run_installer(case, curl, {"BCLAW_VERSION": typed})
+
+        fetches = [line for line in calls if "http" in line]
+        assert fetches, f"{typed}：假 curl 一次都没被调用"
+        assert "/releases/download/v0.1.3/" in fetches[0], (
+            f"BCLAW_VERSION={typed} 没有被归一化，实际请求：{fetches[0]}"
+        )
+        assert (install_dir / "bclaw").exists()

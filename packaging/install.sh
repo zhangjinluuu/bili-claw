@@ -10,7 +10,7 @@
 # 版本转正之后，把 URL 换成 /releases/latest/download/install.sh 即可。
 #
 # 可选环境变量：
-#   BCLAW_VERSION=0.1.3          装指定版本（默认装最新，含预发布）
+#   BCLAW_VERSION=0.1.3          装指定版本（默认装最新，含预发布；带不带 v 都行）
 #   BCLAW_INSTALL_DIR=~/.local/bin   安装到别处
 #   BCLAW_MIRROR=https://gh-proxy.com   国内镜像：在产物 URL 前拼上它
 #       GitHub Releases 在国内常常只有几十 KB/s，20 MB 的包要下十几分钟。
@@ -70,6 +70,13 @@ if [ -z "$VERSION" ]; then
         "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
 fi
+
+# tag 带 `v` 前缀，人未必记得带。`BCLAW_VERSION=0.1.3` 直接拼进 URL 会变成
+# /releases/download/0.1.3/ —— 一个 404，而错误信息看起来像是"这个版本没发布"。
+case "$VERSION" in
+    "" | v*) ;;
+    [0-9]*) VERSION="v${VERSION}" ;;
+esac
 
 if [ -n "$VERSION" ]; then
     URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"

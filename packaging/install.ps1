@@ -10,7 +10,7 @@
     版本转正后换成 /releases/latest/download/install.ps1 即可。
 
     因为整条命令是一行，参数只能靠环境变量传：
-        $env:BCLAW_VERSION = "0.1.3"          # 装指定版本（默认装最新，含预发布）
+        $env:BCLAW_VERSION = "0.1.3"          # 装指定版本（默认装最新，含预发布；带不带 v 都行）
         $env:BCLAW_INSTALL_DIR = "$HOME\bin"  # 装到别处
         $env:BCLAW_MIRROR = "https://gh-proxy.com"  # 国内镜像：加速产物下载
 
@@ -49,6 +49,9 @@ $Archive = "bclaw-windows-$Arch.zip"
 # --- 挑版本 -----------------------------------------------------------------
 # 先问 API 拿 tag：Release 标成预发布后 /releases/latest 会 404，而预发布正是
 # 验证期的常态。API 失败（限流、离线）再退回 latest 重定向。
+# tag 带 `v` 前缀，人未必记得带；直拼进 URL 会 404，而报错像是"这个版本没发布"。
+if ($Version -and $Version -notmatch '^v') { $Version = "v$Version" }
+
 if (-not $Version) {
     try {
         $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" `
