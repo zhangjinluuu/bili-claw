@@ -68,7 +68,7 @@ bclaw --check
 前缀就行，命令其余部分不变：
 
 ```bash
-MIRROR=https://gh-proxy.com
+MIRROR=https://gh-proxy.org
 TAG=v0.1.3
 curl -fsSL "$MIRROR/https://github.com/zhangjinluuu/bili-claw/releases/download/$TAG/install.sh" \
   | BCLAW_VERSION=$TAG BCLAW_MIRROR=$MIRROR sh
@@ -78,8 +78,8 @@ Windows：
 
 ```powershell
 $env:BCLAW_VERSION = "v0.1.3"
-$env:BCLAW_MIRROR  = "https://gh-proxy.com"
-irm https://gh-proxy.com/https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.ps1 | iex
+$env:BCLAW_MIRROR  = "https://gh-proxy.org"
+irm https://gh-proxy.org/https://github.com/zhangjinluuu/bili-claw/releases/download/v0.1.3/install.ps1 | iex
 ```
 
 三点须知：
@@ -90,9 +90,16 @@ irm https://gh-proxy.com/https://github.com/zhangjinluuu/bili-claw/releases/down
 3. **断流会自动续传**。`install.sh` 用 `curl -C -` 从断点接着下，最多重试 5 次，
    所以镜像中途降速不用把命令重敲一遍。
 
-镜像站点会失效，可以换 `https://gh-proxy.com`、`https://ghproxy.net`、`https://gh-proxy.org`、
-`https://ghfast.top` 逐个试。实测 `gh-proxy.com` 表现最好（约 170 KB/s），
-`ghproxy.net` 不到 1 KB/s。
+镜像站点会失效，也会忽快忽慢，换一个就好。同一晚对同一个包实测（各 15 秒）：
+
+| 镜像 | 实测速度 |
+| --- | --- |
+| `https://gh-proxy.org` | 约 2.1 MB/s（20.7 MB 整包 9.5 秒下完） |
+| `https://gh-proxy.com` | 波动极大：瞬时能到 1.6 MB/s，整包走完平均只有 30 KB/s |
+| `https://ghproxy.net` | 约 110 KB/s |
+| `https://ghfast.top` | 连不上（15 秒 0 字节） |
+
+所以默认用 `gh-proxy.org`，下不动再按上表往后换。
 
 <details>
 <summary>从源码安装（开发用）</summary>
